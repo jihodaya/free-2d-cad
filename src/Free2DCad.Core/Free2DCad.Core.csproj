@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net8.0</TargetFramework>
+		<ImplicitUsings>enable</ImplicitUsings>
+		<Nullable>enable</Nullable>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\..\third_party\ACadSharp\src\ACadSharp\ACadSharp.csproj" />
+		<ProjectReference Include="..\Free2DCad.Rendering\Free2DCad.Rendering.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<!-- 새 도면 템플릿 (TemplateBuilder.CreateFromDrawing으로 생성) -->
+		<EmbeddedResource Include="Templates\blank-2004.dwg" LogicalName="Free2DCad.Core.Templates.blank-2004.dwg" Condition="Exists('Templates\blank-2004.dwg')" />
+		<!-- 해치 패턴 (mm) -->
+		<EmbeddedResource Include="Hatching\Free2DCadPatterns.pat" LogicalName="Free2DCad.Core.Hatching.Free2DCadPatterns.pat" />
+	</ItemGroup>
+
+</Project>

@@ -1,0 +1,2358 @@
+diff --git a/src/ACadSharp/CadDocument.cs b/src/ACadSharp/CadDocument.cs
+index 1cfd609d..ede37701 100644
+--- a/src/ACadSharp/CadDocument.cs
++++ b/src/ACadSharp/CadDocument.cs
+@@ -747,6 +747,13 @@ public class CadDocument : IHandledCadObject
+ 			return;
+ 		}
+ 
++		//AddCadObject에서 함께 등록한 BLOCK/ENDBLK도 해제 (없으면 블록을 지웠다 다시 추가할 때 "already assigned" 예외)
++		if (cadObject is BlockRecord record)
++		{
++			this.RemoveCadObject(record.BlockEntity);
++			this.RemoveCadObject(record.BlockEnd);
++		}
++
+ 		cadObject.UnassignDocument();
+ 	}
+ 
+diff --git a/src/ACadSharp/CadObjectCollection.cs b/src/ACadSharp/CadObjectCollection.cs
+index 357cf0fe..143128c8 100644
+--- a/src/ACadSharp/CadObjectCollection.cs
++++ b/src/ACadSharp/CadObjectCollection.cs
+@@ -37,7 +37,16 @@ public class CadObjectCollection<T> : IObservableCadCollection<T>
+ 	/// </summary>
+ 	public CadObject Owner { get; }
+ 
+-	protected readonly HashSet<T> _entries = new HashSet<T>();
++	// F2D: 넣은 순서를 지키는 집합 (HashSet은 지운 자리에 새 항목이 들어가 그리기 순서가 섞였다)
++	protected readonly OrderedEntrySet<T> _entries = new OrderedEntrySet<T>();
++
++	/// <summary>
++	/// F2D: 항목 순서를 바꾼다 (그리기 순서). order에 없는 항목은 뒤에 원래 순서대로 남는다. 이벤트는 일으키지 않는다.
++	/// </summary>
++	public void Reorder(IEnumerable<T> order)
++	{
++		this._entries.Reorder(order);
++	}
+ 
+ 	/// <summary>
+ 	/// Default constructor for a <see cref="CadObjectCollection{T}"/> with it's owner assigned.
+@@ -155,4 +164,52 @@ public class CadObjectCollection<T> : IObservableCadCollection<T>
+ 			return this._entries.ElementAtOrDefault(index);
+ 		}
+ 	}
+-}
+\ No newline at end of file
++}
++
++/// <summary>F2D: 넣은 순서를 지키는 집합 (추가·삭제 O(1)).</summary>
++public sealed class OrderedEntrySet<T> : IEnumerable<T>
++{
++	private readonly LinkedList<T> _list = new();
++	private readonly Dictionary<T, LinkedListNode<T>> _nodes = new();
++
++	public int Count => this._nodes.Count;
++
++	public bool Add(T item)
++	{
++		if (this._nodes.ContainsKey(item)) return false;
++		this._nodes[item] = this._list.AddLast(item);
++		return true;
++	}
++
++	public bool Remove(T item)
++	{
++		if (!this._nodes.Remove(item, out var node)) return false;
++		this._list.Remove(node);
++		return true;
++	}
++
++	public bool Contains(T item) => this._nodes.ContainsKey(item);
++
++	public void Reorder(IEnumerable<T> order)
++	{
++		var seen = new HashSet<T>();
++		var newList = new List<T>();
++		foreach (var item in order)
++		{
++			if (this._nodes.ContainsKey(item) && seen.Add(item)) newList.Add(item);
++		}
++		foreach (var item in this._list)
++		{
++			if (!seen.Contains(item)) newList.Add(item);
++		}
++		this._list.Clear();
++		this._nodes.Clear();
++		foreach (var item in newList) this._nodes[item] = this._list.AddLast(item);
++	}
++
++	public LinkedList<T>.Enumerator GetEnumerator() => this._list.GetEnumerator();
++
++	IEnumerator<T> IEnumerable<T>.GetEnumerator() => this._list.GetEnumerator();
++
++	IEnumerator IEnumerable.GetEnumerator() => this._list.GetEnumerator();
++}
+diff --git a/src/ACadSharp/CadUtils.cs b/src/ACadSharp/CadUtils.cs
+index 7dc0c773..ecbf5e34 100644
+--- a/src/ACadSharp/CadUtils.cs
++++ b/src/ACadSharp/CadUtils.cs
+@@ -11,7 +11,11 @@ internal static class CadUtils
+ 	private static Dictionary<string, CodePage> _dxfEncodingMap = new Dictionary<string, CodePage>
+ 	{
+ 		{"gb2312"    ,CodePage.Gb2312},
++		//GetCodePageName은 첫 번째 일치 항목을 돌려주므로 기존 CAD 표준 이름을 먼저 둔다
++		{"ansi_949"  ,CodePage.Ksc5601},
++		{"ansi_1361" ,CodePage.Johab},
+ 		{"kcs5601"   ,CodePage.Ksc5601},
++		{"ksc5601"   ,CodePage.Ksc5601},
+ 		{"ascii"     ,CodePage.Usascii},
+ 		{"big5"      ,CodePage.big5},
+ 		{"johab"     ,CodePage.Johab},
+@@ -234,7 +238,8 @@ internal static class CadUtils
+ 
+ 	public static string GetCodePageName(CodePage value)
+ 	{
+-		return _dxfEncodingMap.FirstOrDefault(o => o.Value == value).Key;
++		//기존 CAD의 $DWGCODEPAGE 표기(예: ANSI_949)와 맞추기 위해 대문자로 반환
++		return _dxfEncodingMap.FirstOrDefault(o => o.Value == value).Key?.ToUpperInvariant();
+ 	}
+ 
+ 	public static CodePage GetCodePage(int value)
+@@ -244,7 +249,8 @@ internal static class CadUtils
+ 
+ 	public static int GetCodeIndex(CodePage code)
+ 	{
+-		return _pageCodes.ToList().IndexOf(code);
++		//CJK code pages appear twice (DOS and ANSI); CAD writes the ANSI index (e.g. ANSI_949 = 40)
++		return _pageCodes.ToList().LastIndexOf(code);
+ 	}
+ 
+ 	public static ACadVersion GetVersionFromName(string name)
+diff --git a/src/ACadSharp/DxfFileToken.cs b/src/ACadSharp/DxfFileToken.cs
+index 950098c2..606ee5ad 100644
+--- a/src/ACadSharp/DxfFileToken.cs
++++ b/src/ACadSharp/DxfFileToken.cs
+@@ -54,6 +54,8 @@ public static class DxfFileToken
+ 
+ 	public const string EntityArcDimension = "ARC_DIMENSION";
+ 
++	public const string EntityLargeRadialDimension = "LARGE_RADIAL_DIMENSION";
++
+ 	public const string EntityAttribute = "ATTRIB";
+ 
+ 	public const string EntityAttributeDefinition = "ATTDEF";
+diff --git a/src/ACadSharp/DxfSubclassMarker.cs b/src/ACadSharp/DxfSubclassMarker.cs
+index 8c340cb0..fc9c89eb 100644
+--- a/src/ACadSharp/DxfSubclassMarker.cs
++++ b/src/ACadSharp/DxfSubclassMarker.cs
+@@ -26,6 +26,8 @@ public static class DxfSubclassMarker
+ 
+ 	public const string ArcDimension = "AcDbArcDimension";
+ 
++	public const string LargeRadialDimension = "AcDbRadialDimensionLarge";
++
+ 	public const string Attribute = "AcDbAttribute";
+ 
+ 	public const string AttributeDefinition = "AcDbAttributeDefinition";
+diff --git a/src/ACadSharp/Entities/Dimension.cs b/src/ACadSharp/Entities/Dimension.cs
+index c241684a..79201a68 100644
+--- a/src/ACadSharp/Entities/Dimension.cs
++++ b/src/ACadSharp/Entities/Dimension.cs
+@@ -137,7 +137,8 @@ public abstract class Dimension : Entity, IOrientable
+ 	/// <summary>
+ 	/// Indicates if the dimension is angular or linear.
+ 	/// </summary>
+-	public bool IsAngular { get { return this.Flags.HasFlag(DimensionType.Angular3Point) || this.Flags.HasFlag(DimensionType.Angular); } }
++	// F2D: 종류는 아래 4비트 값 (Diameter=3도 Angular=2 비트를 가져 HasFlag로는 각도로 오인됐다)
++	public bool IsAngular { get { var kind = (DimensionType)((int)this.Flags & 0x0F); return kind == DimensionType.Angular3Point || kind == DimensionType.Angular; } }
+ 
+ 	/// <summary>
+ 	/// Indicates if the dimension text has been positioned at a user-defined location rather than at the default location.
+@@ -177,7 +178,7 @@ public abstract class Dimension : Entity, IOrientable
+ 	/// Dimension text line-spacing style.
+ 	/// </summary>
+ 	[DxfCodeValue(DxfReferenceType.Optional, 72)]
+-	public LineSpacingStyleType LineSpacingStyle { get; set; }
++	public LineSpacingStyleType LineSpacingStyle { get; set; } = LineSpacingStyleType.AtLeast; //DWG 규격상 1 또는 2만 유효
+ 
+ 	/// <summary>
+ 	/// Actual measurement.
+@@ -243,6 +244,14 @@ public abstract class Dimension : Entity, IOrientable
+ 	[DxfCodeValue(280)]
+ 	public byte Version { get; set; }
+ 
++	/// <summary>F2D: 선의 두 끝점이 모두 유한한 값이고 길이가 0이 아닌지.</summary>
++	protected static bool isFiniteLine(XYZ a, XYZ b)
++	{
++		bool finite = double.IsFinite(a.X) && double.IsFinite(a.Y) && double.IsFinite(a.Z)
++			&& double.IsFinite(b.X) && double.IsFinite(b.Y) && double.IsFinite(b.Z);
++		return finite && !a.Equals(b);
++	}
++
+ 	protected BlockRecord _block;
+ 
+ 	//This group value is the negative of the angle between the OCS X axis and the UCS X axis.It is always in the XY plane of the OCS
+@@ -250,6 +259,16 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 	private DimensionStyle _style = DimensionStyle.Default;
+ 
++	/// <summary>
++	/// F2D: 블록을 만드는 동안 쓰는 스타일 (DSTYLE 재정의를 적용한 스타일). <see cref="createBlock"/>에서 정한다.
++	/// </summary>
++	private DimensionStyle _activeStyle;
++
++	/// <summary>
++	/// F2D: 재정의를 적용한 현재 스타일 (블록 생성용).
++	/// </summary>
++	protected DimensionStyle ActiveStyle => this._activeStyle ?? this.Style;
++
+ 	protected Dimension(DimensionType type)
+ 	{
+ 		this._flags = type;
+@@ -293,29 +312,106 @@ public abstract class Dimension : Entity, IOrientable
+ 	/// returns the base style; otherwise, returns a copy of the style with overrides applied.</returns>
+ 	public DimensionStyle GetActiveDimensionStyle()
+ 	{
+-		if (!this.HasStyleOverride)
++		return ActiveStyleOf(this, this.Style);
++	}
++
++	/// <summary>
++	/// F2D: 객체(치수·지시선)의 DSTYLE 재정의(XData "ACAD")를 스타일에 적용한 복사본. 재정의가 없으면 스타일 그대로.
++	/// </summary>
++	public static DimensionStyle ActiveStyleOf(CadObject owner, DimensionStyle baseStyle)
++	{
++		if (baseStyle == null)
+ 		{
+-			return this.Style;
++			return null;
++		}
++		DxfClassMap overrideMap = StyleOverrideMapOf(owner);
++		if (overrideMap == null || overrideMap.DxfProperties.Count == 0)
++		{
++			return baseStyle;
+ 		}
+ 
+-		DimensionStyle style = this.Style.CloneTyped();
++		// F2D: 얕은 복사 (참조 객체는 원본 그대로: 문자 스타일·화살촉 블록·선종류를 복제하지 않는다)
++		DimensionStyle style = (DimensionStyle)baseStyle.CloneTyped();
+ 		style.Name = "override";
+-
+-		DxfClassMap styleMap = DxfClassMap.Create<DimensionStyle>(this.Style);
+-		DxfClassMap overrideMap = this.GetStyleOverrideMap();
++		if (baseStyle.Style != null) style.Style = baseStyle.Style;
++		style.LeaderArrow = baseStyle.LeaderArrow;
++		style.ArrowBlock = baseStyle.ArrowBlock;
++		style.DimArrow1 = baseStyle.DimArrow1;
++		style.DimArrow2 = baseStyle.DimArrow2;
++		style.LineType = baseStyle.LineType;
++		style.LineTypeExt1 = baseStyle.LineTypeExt1;
++		style.LineTypeExt2 = baseStyle.LineTypeExt2;
+ 
+ 		foreach (KeyValuePair<int, DxfProperty> item in overrideMap.DxfProperties)
+ 		{
+-			var p = styleMap.DxfProperties[item.Key];
+-			if (p.StoredValue != item.Value.StoredValue)
++			try
+ 			{
+-				p.SetValue(style, item.Value.StoredValue);
++				ApplyStyleOverrideValue(style, item.Key, item.Value.StoredValue, owner.Document);
++			}
++			catch (Exception)
++			{
++				// 알 수 없는 값은 무시 (원래 스타일 값 유지)
+ 			}
+ 		}
+ 
+ 		return style;
+ 	}
+ 
++	/// <summary>
++	/// F2D: DSTYLE 재정의 값 하나를 치수 스타일에 적용한다. 색상(176/177/178/69)은 색상 번호, 핸들(340~347)은 문서에서 찾은 객체.
++	/// </summary>
++	public static void ApplyStyleOverrideValue(DimensionStyle style, int code, object value, CadDocument doc)
++	{
++		if (value == null)
++		{
++			return;
++		}
++
++		switch (code)
++		{
++			case 176: style.DimensionLineColor = new Color(System.Convert.ToInt16(value)); return;
++			case 177: style.ExtensionLineColor = new Color(System.Convert.ToInt16(value)); return;
++			case 178: style.TextColor = new Color(System.Convert.ToInt16(value)); return;
++			case 70: style.TextBackgroundColor = new Color(System.Convert.ToInt16(value)); return;
++			case 340:
++			case 341:
++			case 342:
++			case 343:
++			case 344:
++			case 345:
++			case 346:
++			case 347:
++				{
++					ulong handle = System.Convert.ToUInt64(value);
++					CadObject obj = handle == 0 ? null : doc?.GetCadObject(handle);
++					switch (code)
++					{
++						case 340: if (obj is TextStyle ts) style.Style = ts; break;
++						case 341: style.LeaderArrow = obj as BlockRecord; break;
++						case 342: style.ArrowBlock = obj as BlockRecord; break;
++						case 343: style.DimArrow1 = obj as BlockRecord; break;
++						case 344: style.DimArrow2 = obj as BlockRecord; break;
++						case 345: style.LineType = obj as LineType; break;
++						case 346: style.LineTypeExt1 = obj as LineType; break;
++						case 347: style.LineTypeExt2 = obj as LineType; break;
++					}
++					return;
++				}
++		}
++
++		DxfClassMap styleMap = DxfClassMap.Create<DimensionStyle>();
++		if (!styleMap.DxfProperties.TryGetValue(code, out DxfProperty p))
++		{
++			return;
++		}
++		var type = p.GetValue(style)?.GetType();
++		if (type == typeof(double)) value = System.Convert.ToDouble(value);
++		else if (type == typeof(short)) value = System.Convert.ToInt16(value);
++		else if (type == typeof(int)) value = System.Convert.ToInt32(value);
++		else if (type == typeof(string)) value = System.Convert.ToString(value);
++		p.SetValue(code, style, value);
++	}
++
+ 	/// <summary>
+ 	/// Get the measurement text from the actual <see cref="Dimension.Measurement"/> value.
+ 	/// </summary>
+@@ -337,7 +433,7 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 		UnitStyleFormat unitFormat = style.GetUnitStyleFormat();
+ 
+-		if (this.IsAngular)
++		if (this.IsAngular && this is not DimensionArc) // F2D: 호 길이 치수는 길이로
+ 		{
+ 			switch (style.AngularUnit)
+ 			{
+@@ -386,21 +482,71 @@ public abstract class Dimension : Entity, IOrientable
+ 		}
+ 
+ 		string prefix = string.Empty;
+-		switch (this.Flags)
++		switch (this.Flags & (DimensionType)0x0F) // F2D: 블록 참조(32)·사용자 문자 위치(128) 비트가 있어도 반지름·지름 접두어
+ 		{
+ 			case DimensionType.Diameter:
+-				prefix = string.IsNullOrEmpty(style.Prefix) ? "Ø" : style.Prefix;
++				prefix = string.IsNullOrEmpty(style.Prefix) ? "∅" : style.Prefix; // F2D: 기존 CAD와 같은 ∅ (U+2205)
+ 				break;
+ 			case DimensionType.Radius:
++			case (DimensionType)9: // F2D: 꺾기 반지름 치수 (LARGE_RADIAL_DIMENSION)
+ 				prefix = string.IsNullOrEmpty(style.Prefix) ? "R" : style.Prefix;
+ 				break;
+ 			default:
+ 				prefix = string.IsNullOrEmpty(style.Prefix) ? string.Empty : style.Prefix;
+ 				break;
+ 		}
++		if (this is DimensionArc)
++		{
++			prefix = "⌒" + prefix; // F2D: 호 길이 기호 (DIMARCSYM 0 = 문자 앞)
++		}
+ 
+ 		var valueText = $"{prefix}{text}{style.Suffix}";
+ 
++		// F2D: 한계·공차·대체 단위 (기존 CAD가 다시 그린 치수 블록과 같은 MText 형식)
++		if (!this.IsAngular || this is DimensionArc)
++		{
++			double lfac = style.LinearScaleFactor;
++			if (style.LimitsGeneration)
++			{
++				// 한계: 위 = 값 + 상한, 아래 = 값 - 하한 (기본 정밀도) → \S위^아래;
++				string hi = formatLinear(style, unitFormat, (value + style.PlusTolerance) * lfac);
++				string lo = formatLinear(style, unitFormat, (value - style.MinusTolerance) * lfac);
++				valueText = $"{prefix}{toleranceHeight(style)}\\S{hi}^{lo};{closeHeight(style)}{style.Suffix}";
++			}
++			else if (style.GenerateTolerances)
++			{
++				var tolFormat = style.GetUnitStyleFormat();
++				tolFormat.LinearDecimalPlaces = style.ToleranceDecimalPlaces;
++				tolFormat.LinearZeroHandling = style.ToleranceZeroHandling;
++				double tp = style.PlusTolerance * lfac, tm = style.MinusTolerance * lfac;
++				if (Math.Abs(tp - tm) < 1e-12)
++				{
++					// 대칭: 값±공차
++					valueText = $"{prefix}{text}%%p{formatLinear(style, tolFormat, Math.Abs(tp))}{style.Suffix}";
++				}
++				else
++				{
++					// 편차: 값\S+상한^-하한; (0은 부호 없이)
++					string Signed(double v) => Math.Abs(v) < 1e-12 ? formatLinear(style, tolFormat, 0) : (v > 0 ? "+" : "-") + formatLinear(style, tolFormat, Math.Abs(v));
++					valueText = $"{prefix}{text}{toleranceHeight(style)}\\S{Signed(tp)}^{Signed(-tm)};{closeHeight(style)}{style.Suffix}";
++				}
++			}
++
++			if (style.AlternateUnitDimensioning)
++			{
++				// 대체 단위: " [대체 값]" — DIMAPOST의 []가 값 자리 (없으면 뒤에 붙임)
++				var altFormat = style.GetUnitStyleFormat();
++				altFormat.LinearDecimalPlaces = style.AlternateUnitDecimalPlaces;
++				altFormat.LinearZeroHandling = style.AlternateUnitZeroHandling;
++				double alt = style.ApplyRounding(this.Measurement * lfac * style.AlternateUnitScaleFactor, true);
++				string altText = formatLinear(style, altFormat, alt, style.AlternateUnitFormat);
++				string post = style.AlternateDimensioningSuffix ?? string.Empty;
++				int at = post.IndexOf("[]", StringComparison.Ordinal);
++				altText = at >= 0 ? post.Substring(0, at) + altText + post.Substring(at + 2) : altText + post;
++				valueText += $" [{altText}]";
++			}
++		}
++
+ 		if (!string.IsNullOrEmpty(this.Text))
+ 		{
+ 			var styledText = this.Text;
+@@ -411,6 +557,37 @@ public abstract class Dimension : Entity, IOrientable
+ 		return valueText;
+ 	}
+ 
++	/// <summary>F2D: 길이 값을 단위 형식에 맞춰 문자로.</summary>
++	private static string formatLinear(DimensionStyle style, UnitStyleFormat format, double v, LinearUnitFormat? unit = null)
++	{
++		switch (unit ?? style.LinearUnitFormat)
++		{
++			case LinearUnitFormat.Scientific:
++				return format.ToScientific(v);
++			case LinearUnitFormat.Engineering:
++				return format.ToEngineering(v);
++			case LinearUnitFormat.Architectural:
++				return format.ToArchitectural(v);
++			case LinearUnitFormat.Fractional:
++				return format.ToFractional(v);
++			default:
++				return format.ToDecimal(v);
++		}
++	}
++
++	/// <summary>F2D: 공차 문자 높이 배율 (DIMTFAC가 1이 아니면 {\H배율x; ... }).</summary>
++	private static string toleranceHeight(DimensionStyle style)
++	{
++		double f = style.ToleranceScaleFactor;
++		return f > 0 && Math.Abs(f - 1) > 1e-9 ? "{\\H" + f.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture) + "x;" : string.Empty;
++	}
++
++	private static string closeHeight(DimensionStyle style)
++	{
++		double f = style.ToleranceScaleFactor;
++		return f > 0 && Math.Abs(f - 1) > 1e-9 ? "}" : string.Empty;
++	}
++
+ 	/// <summary>
+ 	/// Retrieves a map of style override properties from the extended data, if present and valid.
+ 	/// </summary>
+@@ -421,7 +598,13 @@ public abstract class Dimension : Entity, IOrientable
+ 	/// override section; otherwise, <see langword="null"/>.</returns>
+ 	public DxfClassMap GetStyleOverrideMap()
+ 	{
+-		if (!this.ExtendedData.TryGet(AppId.DefaultName, out XData.ExtendedData edata))
++		return StyleOverrideMapOf(this);
++	}
++
++	/// <summary>F2D: 객체(치수·지시선)의 DSTYLE 재정의 맵 (없으면 null).</summary>
++	public static DxfClassMap StyleOverrideMapOf(CadObject owner)
++	{
++		if (owner == null || !owner.ExtendedData.TryGet(AppId.DefaultName, out XData.ExtendedData edata))
+ 		{
+ 			return null;
+ 		}
+@@ -557,6 +740,322 @@ public abstract class Dimension : Entity, IOrientable
+ 		this._block = (BlockRecord)this.Block?.Clone();
+ 	}
+ 
++	/// <summary>
++	/// F2D: 치수 문자 크기 재기 (앱이 실제 글꼴로 재도록 정한다). 없으면 글자 수로 어림.
++	/// 돌려주는 값은 회전 전 (폭, 높이).
++	/// </summary>
++	public static Func<MText, CadDocument, (double Width, double Height)?> TextMeasurer { get; set; }
++
++	/// <summary>F2D: 치수 문자 상자 (폭, 높이) = 그린 글자 모양의 범위 (기존 CAD 블록 값과 같음).</summary>
++	protected (double Width, double Height) measureDimText(MText m)
++	{
++		double h = m.Height;
++		(double Width, double Height)? r = null;
++		try
++		{
++			r = TextMeasurer?.Invoke(m, this.Document);
++		}
++		catch (Exception)
++		{
++			r = null;
++		}
++		double w;
++		if (r.HasValue && r.Value.Width > 0)
++		{
++			w = r.Value.Width;
++		}
++		else
++		{
++			// 서식 코드(\A1; {\f...;} 등)를 빼고 글자 수로 어림
++			string plain = System.Text.RegularExpressions.Regex.Replace(m.Value ?? "", @"\\[A-Za-z][^;\\]*;|[{}]|%%[CcDdPp]", "x");
++			w = Math.Max(1, plain.Length) * h * 0.7;
++		}
++		// 높이: 잰 글자 모양 높이 (기존 CAD도 글자 모양 기준, "1.0" 3.5 → 3.636), 못 재면 문자 높이 × 1.0333
++		double bh = r.HasValue && r.Value.Height > 0 ? r.Value.Height : h * 1.0333;
++		return (w, bh);
++	}
++
++	/// <summary>
++	/// F2D: 선형·정렬 치수의 치수선·화살촉·문자 배치 (기존 CAD 규칙).
++	/// r1→r2 = 치수선 양 끝(보조선과 만나는 점), dir = r1→r2 단위 벡터.
++	/// - 문자 방향: 안쪽은 DIMTIH, 바깥은 DIMTOH가 켜지면 수평, 아니면 치수선 방향(읽기 쉬운 쪽).
++	/// - 수평 문자인데 치수선이 수평이 아니거나 DIMTAD 중앙이면 문자를 치수선 위 가운데에 두고 그만큼 치수선을 끊는다.
++	///   그 밖은 DIMTAD(위·밖·JIS·아래)에 따라 간격 + 문자 상자 높이/2 만큼 띄운다.
++	/// - 맞춤(DIMATFIT·DIMTIX): 문자·화살촉이 보조선 사이에 안 들어가면 화살촉을 밖으로(보조선 쪽을 가리키게) 하고
++	///   화살촉 길이만큼 바깥 선을 긋는다. 문자가 밖에 있으면 치수선을 문자 아래까지 늘인다.
++	/// - 기본 화살촉(닫고 채움)은 치수선이 화살촉 밑변에서 시작한다 (기존 CAD 블록과 같음).
++	/// </summary>
++	protected void layoutLinearDimension(XYZ r1, XYZ r2, XYZ dir)
++	{
++		var st = this.ActiveStyle;
++		double scale = st.ScaleFactor > 0 ? st.ScaleFactor : 1.0;
++		double asz = st.ArrowSize * scale;
++		double gap = Math.Abs(st.DimensionLineGap) * scale;
++		double len = (r2 - r1).GetLength();
++		if (len < 1e-12 || double.IsNaN(dir.X))
++		{
++			dir = XYZ.AxisX;
++		}
++		double lineAng = Math.Atan2(dir.Y, dir.X);
++		double readAng = lineAng;
++		while (readAng > Math.PI / 2 + 1e-9) readAng -= Math.PI;
++		while (readAng <= -Math.PI / 2 + 1e-9) readAng += Math.PI;
++		bool lineHorizontal = Math.Abs(Math.Sin(lineAng)) < 1e-6;
++
++		string text = this.GetMeasurementText();
++		MText mText = this.createTextEntity(XYZ.Zero, text);
++		mText.Height = st.TextHeight * scale;
++		var (tw, th) = this.measureDimText(mText);
++		bool hasText = text.Trim().Length > 0;
++		bool basic = st.DimensionLineGap < 0 && hasText; // 기본 치수: 문자 둘레 상자
++		double textOff = basic ? 2 * gap + th / 2 : gap + th / 2;
++
++		double TextRot(bool inside)
++		{
++			if (Math.Abs(this.TextRotation) > 1e-12) return this.TextRotation;
++			bool horiz = inside ? st.TextInsideHorizontal : st.TextOutsideHorizontal;
++			return horiz ? 0.0 : readAng;
++		}
++		// 치수선 방향으로 본 문자 길이
++		double Extent(double rot) => Math.Abs(tw * Math.Cos(rot - lineAng)) + Math.Abs(th * Math.Sin(rot - lineAng));
++
++		double needText = hasText ? Extent(TextRot(true)) + 2 * gap : 0;
++		double needArrows = 2 * asz;
++		bool textInside, arrowsInside;
++		if (len >= needText + needArrows)
++		{
++			textInside = true;
++			arrowsInside = true;
++		}
++		else if (st.TextInsideExtensions)
++		{
++			textInside = true;
++			arrowsInside = false;
++		}
++		else
++		{
++			switch ((int)st.DimensionTextArrowFit) // DIMATFIT (289)
++			{
++				case 1: // 화살촉 먼저
++					arrowsInside = len >= needArrows;
++					textInside = false;
++					break;
++				case 2: // 문자 먼저
++					textInside = len >= needText;
++					arrowsInside = false;
++					break;
++				case 3: // 최적 맞춤
++					textInside = len >= needText;
++					arrowsInside = !textInside && len >= needArrows;
++					break;
++				default: // 문자와 화살촉 모두 밖
++					textInside = false;
++					arrowsInside = false;
++					break;
++			}
++		}
++
++		var b1 = FirstArrowBlock(st);
++		var b2 = SecondArrowBlock(st);
++		XYZ? landingStart = null;
++		double landingWidth = 0;
++
++		// 문자 위치: 사용자가 놓은 곳이 있으면 그대로, 없으면 가운데(안) 또는 둘째 보조선 바깥(밖)
++		XYZ up = XYZ.Cross(this.Normal, dir).Normalize();
++		XYZ center;
++		double rot;
++		bool onLine;
++		if (this.IsTextUserDefinedLocation)
++		{
++			// 기존 CAD: 사용자가 옮긴 문자 위치(TextMiddlePoint)는 치수선 위의 점이고, 그리는 문자는 DIMTAD만큼 띄운다
++			XYZ userPt = this.TextMiddlePoint;
++			double t = (userPt - r1).Dot(dir);
++			bool inside = t >= 0 && t <= len;
++			rot = TextRot(inside);
++			bool horizontalText = Math.Abs(rot) < 1e-12;
++			onLine = st.TextVerticalAlignment == DimensionTextVerticalAlignment.Centered || (horizontalText && !lineHorizontal);
++			center = onLine ? userPt : offsetText(userPt, rot, textOff, up);
++		}
++		else
++		{
++			rot = TextRot(textInside);
++			double ext = Extent(rot);
++			bool horizontalText = Math.Abs(rot) < 1e-12;
++			onLine = st.TextVerticalAlignment == DimensionTextVerticalAlignment.Centered || (horizontalText && !lineHorizontal);
++			// 밖에 둘 때 (띄운 문자): 화살촉 다음, 그 밑으로 치수선이 지나감
++			XYZ basePt = textInside
++				? r1 + (r2 - r1) * 0.5
++				: r2 + dir * (asz + gap + ext / 2);
++			if (!textInside && horizontalText && !lineHorizontal)
++			{
++				// 기존 CAD: 수평 문자를 기울어진(수직) 치수선 바깥에 둘 때는 짧은 선 끝에서 오른쪽으로 받침선을 긋고 그 위에 문자
++				landingStart = r2 + dir * (arrowsInside ? asz : (b2 == null ? asz : 0) + asz);
++				landingWidth = gap + tw;
++				basePt = landingStart.Value + XYZ.AxisX * (gap + tw / 2) + XYZ.AxisY * (gap + th / 2);
++				onLine = false;
++				rot = 0;
++			}
++			if (!onLine && !landingStart.HasValue)
++			{
++				basePt = offsetText(basePt, rot, textOff, up);
++			}
++			center = basePt;
++			this.TextMiddlePoint = center;
++		}
++
++		// 문자가 치수선 방향으로 차지하는 구간 [a, b] (r1 기준)
++		double tc = (center - r1).Dot(dir);
++		double half = hasText ? Extent(rot) / 2 : 0;
++		double ta = tc - half, tb = tc + half;
++
++		// 치수선 구간 계산
++		bool sd1 = st.SuppressFirstDimensionLine, sd2 = st.SuppressSecondDimensionLine;
++		var segs = new List<(double A, double B)>();
++		if (arrowsInside)
++		{
++			double a = b1 == null ? asz : 0;
++			double b = len - (b2 == null ? asz : 0);
++			if (b > a) segs.Add((a, b));
++		}
++		else
++		{
++			// 바깥 화살촉: 밑변에서 화살촉 길이만큼 바깥으로
++			double o1 = b1 == null ? -asz : 0;
++			double o2 = b2 == null ? len + asz : len;
++			segs.Add((o1 - asz, o1));
++			segs.Add((o2, o2 + asz));
++			if (st.TextOutsideExtensions)
++			{
++				segs.Add((0, len)); // DIMTOFL: 보조선 사이에도 치수선
++			}
++		}
++		// 문자가 보조선 바깥에 있으면 그쪽 치수선을 문자 끝 + 간격까지 늘린다
++		// (화살촉이 밖이면 그 짧은 선을, 안이면 보조선에서부터)
++		if (landingStart.HasValue)
++		{
++			if (arrowsInside) segs.Add((len, len + asz));
++		}
++		else if (hasText && (tb < 0 || ta > len))
++		{
++			bool left = tc < 0;
++			double reach = onLine
++				? (left ? tb + gap : ta - gap)   // 선 위 문자: 문자 앞까지
++				: (left ? ta - gap : tb + gap);  // 띄운 문자: 문자 밑을 지나 끝까지
++			if (arrowsInside)
++			{
++				if (left) segs.Add((Math.Min(reach, 0), 0)); else segs.Add((len, Math.Max(reach, len)));
++			}
++			else
++			{
++				int i = left ? 0 : 1;
++				var (a, b) = segs[i];
++				segs[i] = left ? (Math.Min(a, reach), b) : (a, Math.Max(b, reach));
++			}
++		}
++		// 문자를 선 위 가운데에 두면 그 구간을 끊는다
++		if (hasText && onLine && !landingStart.HasValue)
++		{
++			double ca = ta - (basic ? 2 : 1) * gap, cb = tb + (basic ? 2 : 1) * gap;
++			var cut = new List<(double A, double B)>();
++			foreach (var (a, b) in segs)
++			{
++				if (b <= ca || a >= cb) { cut.Add((a, b)); continue; }
++				if (a < ca) cut.Add((a, ca));
++				if (b > cb) cut.Add((cb, b));
++			}
++			segs = cut;
++		}
++		// 치수선 1·2 끄기 (가운데 기준 반쪽씩)
++		double mid = len / 2;
++		foreach (var (a0, b0) in segs)
++		{
++			double a = a0, b = b0;
++			if (b - a < 1e-9) continue;
++			if (sd1 && sd2) break;
++			if (sd1) a = Math.Max(a, mid);
++			if (sd2) b = Math.Min(b, mid);
++			if (b - a < 1e-9) continue;
++			this._block.Entities.Add(dimensionLine(r1 + dir * a, r1 + dir * b, st));
++		}
++
++		if (landingStart.HasValue && !sd2)
++		{
++			this._block.Entities.Add(dimensionLine(landingStart.Value, landingStart.Value + XYZ.AxisX * landingWidth, st));
++		}
++
++		// 화살촉
++		if (!sd1) this._block.Entities.Add(this.dimensionArrow(r1, arrowsInside ? -dir : dir, st, b1));
++		if (!sd2) this._block.Entities.Add(this.dimensionArrow(r2, arrowsInside ? dir : -dir, st, b2));
++
++		// 문자
++		if (hasText)
++		{
++			mText.InsertPoint = center;
++			mText.AlignmentPoint = new XYZ(Math.Cos(rot), Math.Sin(rot), 0);
++			this._block.Entities.Add(mText);
++			if (basic)
++			{
++				this.addTextBox(center, rot, tw / 2 + gap, th / 2 + gap, st);
++			}
++		}
++	}
++
++	/// <summary>F2D: 기본 치수 상자 (기존 CAD: 선 네 개, 문자 가운데 ± (폭/2 + 간격, 높이/2 + 간격)).</summary>
++	private void addTextBox(XYZ center, double rot, double hw, double hh, DimensionStyle st)
++	{
++		XYZ ux = new XYZ(Math.Cos(rot), Math.Sin(rot), 0);
++		XYZ uy = new XYZ(-Math.Sin(rot), Math.Cos(rot), 0);
++		var pts = new[]
++		{
++			center - ux * hw - uy * hh,
++			center + ux * hw - uy * hh,
++			center + ux * hw + uy * hh,
++			center - ux * hw + uy * hh,
++		};
++		for (int i = 0; i < 4; i++)
++		{
++			this._block.Entities.Add(dimensionLine(pts[i], pts[(i + 1) % 4], st));
++		}
++	}
++
++	/// <summary>F2D: DIMTAD에 따라 문자 가운데를 띄운다 (위·JIS = 문자 위쪽, 아래 = 아래쪽, 밖 = 측정점 반대쪽).</summary>
++	private XYZ offsetText(XYZ pt, double rot, double off, XYZ up)
++	{
++		var st = this.ActiveStyle;
++		XYZ textUp = new XYZ(-Math.Sin(rot), Math.Cos(rot), 0);
++		switch (st.TextVerticalAlignment)
++		{
++			case DimensionTextVerticalAlignment.Centered:
++				return pt;
++			case DimensionTextVerticalAlignment.Below:
++				return pt - textUp * off;
++			case DimensionTextVerticalAlignment.Outside:
++				{
++					XYZ away = (this.DefinitionPoint - this.measurementOrigin()).Dot(up) < 0 ? -up : up;
++					double sgn = textUp.Dot(away) >= 0 ? 1 : -1;
++					return pt + textUp * (off * sgn);
++				}
++			default:
++				return pt + textUp * off;
++		}
++	}
++
++	/// <summary>F2D: 치수 문자 (GetMeasurementText가 문자 재정의 &lt;&gt;까지 처리).</summary>
++	protected string radialText()
++	{
++		string text = this.GetMeasurementText();
++		return text;
++	}
++
++	/// <summary>F2D: 측정점 (보조선이 시작하는 쪽) — 문자 "밖" 배치 방향 판단용.</summary>
++	protected virtual XYZ measurementOrigin() => this.DefinitionPoint;
++
++	/// <summary>F2D: 첫 화살촉 블록 (DIMSAH 켜짐 = DIMBLK1, 아니면 DIMBLK). null = 닫고 채움.</summary>
++	public static BlockRecord FirstArrowBlock(DimensionStyle st) => st.SeparateArrowBlocks ? st.DimArrow1 : st.ArrowBlock;
++
++	/// <summary>F2D: 둘째 화살촉 블록 (DIMSAH 켜짐 = DIMBLK2, 아니면 DIMBLK).</summary>
++	public static BlockRecord SecondArrowBlock(DimensionStyle st) => st.SeparateArrowBlocks ? st.DimArrow2 : st.ArrowBlock;
++
+ 	protected static Entity dimensionLine(XYZ start, XYZ end, DimensionStyle style)
+ 	{
+ 		return new Line(start, end)
+@@ -577,6 +1076,75 @@ public abstract class Dimension : Entity, IOrientable
+ 		};
+ 	}
+ 
++	/// <summary>
++	/// F2D: 반지름·지름 치수의 바깥 수평 문자 (DIMTOH 켜짐) — 기존 CAD 블록과 같은 모양:
++	/// 원 위 화살촉 → 화살촉 밑변에서 바깥으로 화살촉 길이만큼 지시선 → 꺾인 점에서 수평 받침선(간격 + 문자 폭) → 그 위에 문자.
++	/// 사용자가 옮긴 문자는 저장된 점이 받침선 높이·문자 가운데이고, 꺾인 점은 지시선 연장이 그 높이를 만나는 곳.
++	/// 처리했으면 true (치수선·화살촉·문자를 모두 넣음).
++	/// </summary>
++	protected bool radialLanding(XY center, XY ref1, double angleRef, short inside, string text)
++	{
++		var st = this.ActiveStyle;
++		if (inside > 0 || !st.TextOutsideHorizontal || Math.Abs(this.TextRotation) > 1e-12)
++		{
++			return false;
++		}
++		double scale = st.ScaleFactor > 0 ? st.ScaleFactor : 1.0;
++		double asz = st.ArrowSize * scale;
++		double gap = Math.Abs(st.DimensionLineGap) * scale;
++		XY u = (ref1 - center);
++		double ul = u.GetLength();
++		if (ul < 1e-12)
++		{
++			return false;
++		}
++		u = u / ul;
++		var arrowBlock = SecondArrowBlock(st);
++		XY baseP = arrowBlock == null ? ref1 + u * asz : ref1;
++
++		MText mText = this.createTextEntity(XYZ.Zero, text);
++		var (tw, th) = this.measureDimText(mText);
++
++		XY knee;
++		XY textCenter;
++		double side;
++		double farEdge;
++		if (this.IsTextUserDefinedLocation)
++		{
++			XY p = this.TextMiddlePoint.Convert<XY>();
++			double t = Math.Abs(u.Y) > 1e-6 ? (p.Y - baseP.Y) / u.Y : asz;
++			if (t < 0) t = asz;
++			knee = baseP + u * t;
++			side = p.X >= knee.X ? 1 : -1;
++			textCenter = new XY(p.X, knee.Y + gap + th / 2);
++			farEdge = p.X + side * tw / 2;
++		}
++		else
++		{
++			knee = baseP + u * asz;
++			side = u.X >= 0 ? 1 : -1;
++			textCenter = new XY(knee.X + side * (gap + tw / 2), knee.Y + gap + th / 2);
++			farEdge = knee.X + side * (gap + tw);
++			this.TextMiddlePoint = textCenter.Convert<XYZ>();
++		}
++
++		if (!st.SuppressFirstDimensionLine || !st.SuppressSecondDimensionLine)
++		{
++			if ((knee - baseP).GetLength() > 1e-9)
++			{
++				this._block.Entities.Add(dimensionLine(baseP.Convert<XYZ>(), knee.Convert<XYZ>(), st));
++			}
++			this._block.Entities.Add(dimensionLine(knee.Convert<XYZ>(), new XYZ(farEdge, knee.Y, 0), st));
++			this._block.Entities.Add(this.radialArrow(ref1, angleRef, inside));
++		}
++
++		mText.InsertPoint = textCenter.Convert<XYZ>();
++		mText.AttachmentPoint = AttachmentPointType.MiddleCenter;
++		mText.AlignmentPoint = XYZ.AxisX;
++		this._block.Entities.Add(mText);
++		return true;
++	}
++
+ 	protected void angularBlock(double radius, XY centerRef, XY ref1, double minOffset, bool drawRef2)
+ 	{
+ 		//Common for Diameter and radial
+@@ -604,34 +1172,58 @@ public abstract class Dimension : Entity, IOrientable
+ 			inside = 1;
+ 		}
+ 
+-		XY dimRef = XY.Polar(centerRef, offset - this.Style.DimensionLineGap * this.Style.ScaleFactor, angleRef);
++		XY dimRef = XY.Polar(centerRef, offset - this.ActiveStyle.DimensionLineGap * this.ActiveStyle.ScaleFactor, angleRef);
+ 
+ 		// reference points
+ 		Layer defPoints = Layer.Defpoints;
+ 		this._block.Entities.Add(new Point(ref1.Convert<XYZ>()) { Layer = defPoints });
+ 
++		// F2D: 바깥 수평 문자는 기존 CAD처럼 지시선 + 받침선
++		if (this.radialLanding(centerRef, ref1, angleRef, inside, this.radialText()))
++		{
++			if (this.ActiveStyle.TextOutsideExtensions)
++			{
++				this._block.Entities.Add(new Line(defPoint, ref1)
++				{
++					Color = this.ActiveStyle.DimensionLineColor,
++					LineType = this.ActiveStyle.LineType ?? LineType.ByLayer,
++					LineWeight = this.ActiveStyle.DimensionLineWeight
++				});
++			}
++			if (!this.ActiveStyle.CenterMarkSize.IsZero())
++			{
++				this._block.Entities.AddRange(centerCross(centerRef.Convert<XYZ>(), radius, this.ActiveStyle));
++			}
++			return;
++		}
++
+ 		// dimension lines
+-		if (!this.Style.SuppressFirstDimensionLine && !this.Style.SuppressSecondDimensionLine)
++		if (!this.ActiveStyle.SuppressFirstDimensionLine && !this.ActiveStyle.SuppressSecondDimensionLine)
+ 		{
+ 			if (inside > 0)
+ 			{
+ 				this._block.Entities.Add(dimensionRadialLine(dimRef, ref1, angleRef, inside));
+-				//End Arrow
++				// F2D: 화살촉 (원 위 점, 안쪽 문자면 바깥으로)
++				this._block.Entities.Add(this.radialArrow(ref1, angleRef, inside));
+ 			}
+ 			else
+ 			{
+-				this._block.Entities.Add(new Line(defPoint, ref1)
++				// F2D: 원 안쪽 치수선은 DIMTOFL이 켜졌을 때만 (기존 CAD와 같음)
++				if (this.ActiveStyle.TextOutsideExtensions)
+ 				{
+-					Color = this.Style.DimensionLineColor,
+-					LineType = this.Style.LineType ?? LineType.ByLayer,
+-					LineWeight = this.Style.DimensionLineWeight
+-				});
++					this._block.Entities.Add(new Line(defPoint, ref1)
++					{
++						Color = this.ActiveStyle.DimensionLineColor,
++						LineType = this.ActiveStyle.LineType ?? LineType.ByLayer,
++						LineWeight = this.ActiveStyle.DimensionLineWeight
++					});
++				}
+ 				this._block.Entities.Add(dimensionRadialLine(dimRef, ref1, angleRef, inside));
+-				//End Arrow
++				this._block.Entities.Add(this.radialArrow(ref1, angleRef, inside));
+ 
+ 				if (drawRef2)
+ 				{
+-					XY dimRef2 = XY.Polar(centerRef, radius + minOffset - this.Style.DimensionLineGap * this.Style.ScaleFactor, Math.PI + angleRef);
++					XY dimRef2 = XY.Polar(centerRef, radius + minOffset - this.ActiveStyle.DimensionLineGap * this.ActiveStyle.ScaleFactor, Math.PI + angleRef);
+ 					this._block.Entities.Add(dimensionRadialLine(dimRef2, defPoint, Math.PI + angleRef, inside));
+ 					//End Arrow
+ 				}
+@@ -639,9 +1231,9 @@ public abstract class Dimension : Entity, IOrientable
+ 		}
+ 
+ 		// center cross
+-		if (!this.Style.CenterMarkSize.IsZero())
++		if (!this.ActiveStyle.CenterMarkSize.IsZero())
+ 		{
+-			this._block.Entities.AddRange(centerCross(centerRef.Convert<XYZ>(), radius, this.Style));
++			this._block.Entities.AddRange(centerCross(centerRef.Convert<XYZ>(), radius, this.ActiveStyle));
+ 		}
+ 
+ 		// dimension text
+@@ -657,7 +1249,7 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 		if (!this.IsTextUserDefinedLocation)
+ 		{
+-			XY textPos = XY.Polar(dimRef, -reverse * inside * this.Style.DimensionLineGap * this.Style.ScaleFactor, textRot);
++			XY textPos = XY.Polar(dimRef, -reverse * inside * this.ActiveStyle.DimensionLineGap * this.ActiveStyle.ScaleFactor, textRot);
+ 			this.TextMiddlePoint = textPos.Convert<XYZ>();
+ 		}
+ 
+@@ -712,6 +1304,9 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 	protected void createBlock()
+ 	{
++		this._activeStyle = null;
++		this._activeStyle = this.GetActiveDimensionStyle();
++
+ 		if (this._block == null)
+ 		{
+ 			this._block = new BlockRecord(this.generateBlockName());
+@@ -726,6 +1321,144 @@ public abstract class Dimension : Entity, IOrientable
+ 		this._block.Entities.Clear();
+ 	}
+ 
++	/// <summary>
++	/// F2D: 각도 치수 블록 (2선·3점 공통). c = 꼭짓점, d1·d2 = 두 반직선 방향(단위), t·min/max = 각 반직선 위 원래 객체 범위
++	/// (보조선 길이 계산용), arcPoint = 치수 호가 지나는 점. 호 쪽(호 점을 품는 부채꼴)을 재고 호·화살표·보조선·각도 문자를 만든다.
++	/// </summary>
++	protected void buildAngularBlock(XYZ c, XYZ d1, double t1min, double t1max, XYZ d2, double t2min, double t2max, XYZ arcPoint)
++	{
++		var style = this.ActiveStyle;
++		double scale = style.ScaleFactor > 0 ? style.ScaleFactor : 1.0;
++		double radius = Math.Sqrt((arcPoint.X - c.X) * (arcPoint.X - c.X) + (arcPoint.Y - c.Y) * (arcPoint.Y - c.Y));
++		if (radius < 1e-9 || double.IsNaN(c.X) || double.IsNaN(c.Y))
++		{
++			return;
++		}
++
++		static double Norm(double a)
++		{
++			a %= 2 * Math.PI;
++			return a < 0 ? a + 2 * Math.PI : a;
++		}
++
++		double a1 = Math.Atan2(d1.Y, d1.X), a2 = Math.Atan2(d2.Y, d2.X);
++		double aa = Math.Atan2(arcPoint.Y - c.Y, arcPoint.X - c.X);
++		// 시계 반대 방향으로 시작 → 끝 부채꼴이 호 점을 품도록
++		bool firstIsStart = Norm(aa - a1) <= Norm(a2 - a1);
++		double s = firstIsStart ? a1 : a2, e = firstIsStart ? a2 : a1;
++		double sweep = Norm(e - s);
++		double sMin = firstIsStart ? t1min : t2min, sMax = firstIsStart ? t1max : t2max;
++		double eMin = firstIsStart ? t2min : t1min, eMax = firstIsStart ? t2max : t1max;
++
++		XYZ At(double ang, double r) => new XYZ(c.X + r * Math.Cos(ang), c.Y + r * Math.Sin(ang), c.Z);
++
++		// 정의점
++		this._block.Entities.Add(this.createDefinitionPoint(At(s, sMax > 0 ? sMax : radius)));
++		this._block.Entities.Add(this.createDefinitionPoint(At(e, eMax > 0 ? eMax : radius)));
++
++		// 치수 호 (문자가 호 가운데에 걸치면 아래에서 둘로 나눈다)
++		Arc dimArc = new Arc
++		{
++			Center = c,
++			Radius = radius,
++			StartAngle = Norm(s),
++			EndAngle = Norm(e),
++			Color = style.DimensionLineColor,
++			LineType = style.LineType ?? LineType.ByLayer,
++			LineWeight = style.DimensionLineWeight,
++		};
++		this._block.Entities.Add(dimArc);
++
++		// 화살표: 호 양 끝에서 바깥쪽(접선 방향)
++		this._block.Entities.Add(this.dimensionArrow(At(s, radius), new XYZ(Math.Sin(s), -Math.Cos(s), 0), style, FirstArrowBlock(style)));
++		this._block.Entities.Add(this.dimensionArrow(At(e, radius), new XYZ(-Math.Sin(e), Math.Cos(e), 0), style, SecondArrowBlock(style)));
++
++		// 보조선: 호가 원래 선의 범위 밖이면 선 끝에서 호까지
++		double exo = style.ExtensionLineOffset * scale, exe = style.ExtensionLineExtension * scale;
++		void Ext(double ang, double tmin, double tmax, LineType lt)
++		{
++			if (!style.SuppressFirstExtensionLine || !style.SuppressSecondExtensionLine)
++			{
++				if (radius > tmax + exo)
++				{
++					this._block.Entities.Add(extensionLine(At(ang, tmax + exo), At(ang, radius + exe), style, lt));
++				}
++				else if (radius < tmin - exo)
++				{
++					this._block.Entities.Add(extensionLine(At(ang, tmin - exo), At(ang, radius - exe), style, lt));
++				}
++			}
++		}
++		if (!style.SuppressFirstExtensionLine) Ext(s, sMin, sMax, style.LineTypeExt1);
++		if (!style.SuppressSecondExtensionLine) Ext(e, eMin, eMax, style.LineTypeExt2);
++
++		// 각도 문자: 호 가운데 바깥쪽, 호를 따라 읽기 쉬운 방향
++		string text = this.GetMeasurementText();
++		double h = style.TextHeight * scale;
++		double gap = style.DimensionLineGap * scale;
++		double mid = s + sweep / 2;
++		// F2D: 문자 위치 (기존 CAD 규칙)
++		//  - 문자를 수평으로(DIMTIH) 쓰고 그 자리의 치수선이 수평에 가까우면: DIMTAD "위"는 치수선 위쪽(도면 +Y)에 띄움
++		//  - 문자는 수평인데 치수선이 기울었거나 DIMTAD "중앙"이면: 문자를 호 위 가운데에 두고 그만큼 호를 끊음
++		//  - 문자를 치수선 방향으로 쓰면: "위"는 호 바깥쪽에 띄움
++		bool horizontalText = style.TextInsideHorizontal && Math.Abs(this.TextRotation) < 1e-12;
++		bool lineHorizontal = Math.Abs(Math.Sin(mid)) > Math.Cos(15 * Math.PI / 180);
++		bool centered = style.TextVerticalAlignment == DimensionTextVerticalAlignment.Centered || (horizontalText && !lineHorizontal);
++		if (!this.IsTextUserDefinedLocation)
++		{
++			if (centered)
++			{
++				this.TextMiddlePoint = At(mid, radius);
++			}
++			else if (horizontalText)
++			{
++				XYZ onArc = At(mid, radius);
++				this.TextMiddlePoint = new XYZ(onArc.X, onArc.Y + gap + h / 2, onArc.Z);
++			}
++			else
++			{
++				this.TextMiddlePoint = At(mid, radius + gap + h / 2);
++			}
++		}
++		if (centered && !this.IsTextUserDefinedLocation)
++		{
++			// 문자 상자(대략 글자 수 × 0.7h × h)가 호 접선 방향으로 차지하는 절반 길이 + 간격
++			double w = Math.Max(text.Length, 1) * h * 0.7;
++			double tx = -Math.Sin(mid), ty = Math.Cos(mid);
++			double half = horizontalText ? Math.Abs(tx) * w / 2 + Math.Abs(ty) * h / 2 : w / 2;
++			double ga = (half + gap) / radius;
++			if (2 * ga < sweep)
++			{
++				this._block.Entities.Remove(dimArc);
++				this._block.Entities.Add(new Arc { Center = c, Radius = radius, StartAngle = Norm(s), EndAngle = Norm(mid - ga), Color = dimArc.Color, LineType = dimArc.LineType, LineWeight = dimArc.LineWeight });
++				this._block.Entities.Add(new Arc { Center = c, Radius = radius, StartAngle = Norm(mid + ga), EndAngle = Norm(e), Color = dimArc.Color, LineType = dimArc.LineType, LineWeight = dimArc.LineWeight });
++			}
++		}
++		double rot = Norm(mid - Math.PI / 2);
++		if (rot > Math.PI / 2 && rot <= 3 * Math.PI / 2)
++		{
++			rot += Math.PI;
++		}
++		// F2D: 치수 스타일의 "문자 수평"(DIMTIH)이면 수평, 문자 각도를 따로 주면 그 각도
++		if (style.TextInsideHorizontal)
++		{
++			rot = 0;
++		}
++		if (Math.Abs(this.TextRotation) > 1e-12)
++		{
++			rot = this.TextRotation;
++		}
++		MText mText = this.createTextEntity(this.TextMiddlePoint, text);
++		mText.Height = h;
++		mText.AlignmentPoint = new XYZ(Math.Cos(rot), Math.Sin(rot), 0);
++		mText.Color = style.TextColor;
++		if (style.Style != null)
++		{
++			mText.Style = style.Style;
++		}
++		this._block.Entities.Add(mText);
++	}
++
+ 	protected Point createDefinitionPoint(XYZ location)
+ 	{
+ 		return new Point(location) { Layer = Layer.Defpoints };
+@@ -733,17 +1466,36 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 	protected MText createTextEntity(XYZ insertPoint, string text)
+ 	{
++		// F2D: 공차·한계 쌓기는 DIMTOLJ 세로 정렬을 앞에 (기존 CAD 블록 "\A1;30.0\S+0.1^-0.2;" — 없으면 기존 CAD가 위 칸을 띄워 그림)
++		if (text.Contains("\\S") && !text.StartsWith("\\A", StringComparison.Ordinal))
++		{
++			text = $"\\A{(int)this.ActiveStyle.ToleranceAlignment};{text}";
++		}
+ 		MText mText = new MText()
+ 		{
+ 			Value = text,
+ 			AttachmentPoint = AttachmentPointType.MiddleCenter,
+ 			InsertPoint = insertPoint,
+-			Height = this.Style.TextHeight
++			Height = this.ActiveStyle.TextHeight,
++			// F2D: 치수 문자 색(DIMCLRT)·문자 스타일 (예전에는 ByLayer라 스타일의 노란색 대신 도면층 색으로 보였다)
++			Color = this.ActiveStyle.TextColor,
+ 		};
++		if (this.ActiveStyle.Style != null)
++		{
++			mText.Style = this.ActiveStyle.Style;
++		}
+ 
+ 		return mText;
+ 	}
+ 
++	/// <summary>F2D: 반지름·지름 치수 화살촉. inside &gt; 0(문자가 원 안)이면 바깥쪽, 아니면 중심 쪽을 가리킨다.</summary>
++	protected Entity radialArrow(XY tip, double angleRef, short inside)
++	{
++		double sign = inside > 0 ? 1 : -1;
++		var dir = new XYZ(Math.Cos(angleRef) * sign, Math.Sin(angleRef) * sign, 0);
++		return this.dimensionArrow(tip.Convert<XYZ>(), dir, this.ActiveStyle, SecondArrowBlock(this.ActiveStyle));
++	}
++
+ 	protected Entity dimensionArrow(XYZ insertPoint, XYZ dir, DimensionStyle style, BlockRecord record)
+ 	{
+ 		double scale = style.ArrowSize * style.ScaleFactor;
+@@ -757,7 +1509,8 @@ public abstract class Dimension : Entity, IOrientable
+ 			arrow.FirstCorner = insertPoint;
+ 			arrow.SecondCorner = insertPoint - scale * dir - scale / 6 * p;
+ 			arrow.ThirdCorner = insertPoint - scale * dir + scale / 6 * p;
+-			arrow.FourthCorner = arrow.ThirdCorner;
++			arrow.FourthCorner = arrow.ThirdCorner; // F2D: 기본 화살촉도 치수선 색 (전에는 ByBlock이라 치수선과 색이 달랐다)
++			arrow.Color = style.DimensionLineColor;
+ 
+ 			return arrow;
+ 		}
+@@ -780,7 +1533,7 @@ public abstract class Dimension : Entity, IOrientable
+ 
+ 	protected Line dimensionRadialLine(XY start, XY end, double rotation, short reversed)
+ 	{
+-		var style = this.Style;
++		var style = this.ActiveStyle;
+ 		double ext = -style.ArrowSize * style.ScaleFactor;
+ 
+ 		end = XY.Polar(end, reversed * ext, rotation);
+diff --git a/src/ACadSharp/Entities/DimensionAligned.cs b/src/ACadSharp/Entities/DimensionAligned.cs
+index 2a54d83f..78c5e165 100644
+--- a/src/ACadSharp/Entities/DimensionAligned.cs
++++ b/src/ACadSharp/Entities/DimensionAligned.cs
+@@ -102,6 +102,9 @@ namespace ACadSharp.Entities
+ 			this.SecondPoint = this.applyWorldMatrix(this.SecondPoint, transform, transOW, transWO);
+ 		}
+ 
++		/// <inheritdoc/>
++		protected override XYZ measurementOrigin() => this.FirstPoint;
++
+ 		/// <inheritdoc/>
+ 		public override BoundingBox GetBoundingBox()
+ 		{
+@@ -116,7 +119,9 @@ namespace ACadSharp.Entities
+ 			XYZ dir = (this.SecondPoint - this.FirstPoint).Normalize();
+ 			XYZ vec = XYZ.Cross(this.Normal, dir).Normalize();
+ 
+-			XYZ dimRef1 = this.FirstPoint + vec * this.Offset;
++			// F2D: 부호 있는 간격 (Offset은 거리라 항상 양수 → 반대쪽에 놓으면 첫 보조선이 반대편으로 가서 치수선이 기울었다)
++			double offset = (this.DefinitionPoint - this.SecondPoint).Dot(vec);
++			XYZ dimRef1 = this.FirstPoint + vec * offset;
+ 			XYZ dimRef2 = this.DefinitionPoint;
+ 
+ 			// reference points
+@@ -125,44 +130,38 @@ namespace ACadSharp.Entities
+ 			this._block.Entities.Add(createDefinitionPoint(dimRef1));
+ 			this._block.Entities.Add(createDefinitionPoint(dimRef2));
+ 
+-			if (!this.Style.SuppressFirstDimensionLine && !this.Style.SuppressSecondDimensionLine)
+-			{
+-				this._block.Entities.Add(dimensionLine(dimRef1, dimRef2, this.Style));
+-				this._block.Entities.Add(dimensionArrow(dimRef1, -dir, this.Style, this.Style.DimArrow1));
+-				this._block.Entities.Add(dimensionArrow(dimRef1, dir, this.Style, this.Style.DimArrow2));
+-			}
+ 
+ 			// extension lines
+-			double thisexo = Math.Sign(this.Offset) * this.Style.ExtensionLineOffset * this.Style.ScaleFactor;
+-			double thisexe = Math.Sign(this.Offset) * this.Style.ExtensionLineExtension * this.Style.ScaleFactor;
+-			if (!this.Style.SuppressFirstExtensionLine)
+-			{
+-				this._block.Entities.Add(extensionLine(this.FirstPoint + thisexo * vec, dimRef1 + thisexe * vec, this.Style, this.Style.LineTypeExt1));
+-			}
+-
+-			if (!this.Style.SuppressSecondExtensionLine)
+-			{
+-				this._block.Entities.Add(extensionLine(this.SecondPoint + thisexo * vec, dimRef2 + thisexe * vec, this.Style, this.Style.LineTypeExt2));
+-			}
+-
+-			// dimension text
+-			XYZ textRef = dimRef1.Mid(dimRef2);
+-			double gap = this.Style.DimensionLineGap * this.Style.ScaleFactor;
+-			double textRot = (double)this.ExtLineRotation;
+-			if (textRot > Math.PI / 2 && textRot <= (3 * Math.PI * 0.5))
++			double thisexo = Math.Sign(offset) * this.ActiveStyle.ExtensionLineOffset * this.ActiveStyle.ScaleFactor;
++			double thisexe = Math.Sign(offset) * this.ActiveStyle.ExtensionLineExtension * this.ActiveStyle.ScaleFactor;
++			if (!this.ActiveStyle.SuppressFirstExtensionLine)
+ 			{
+-				gap = -gap;
+-				textRot += Math.PI;
++				{
++					XYZ extStart = this.FirstPoint + thisexo * vec;
++					XYZ extEnd = dimRef1 + thisexe * vec;
++					// F2D: 측정점이 치수선 위에 있으면 방향이 0 벡터라 NaN 선이 생겼다 → 건너뜀
++					if (isFiniteLine(extStart, extEnd))
++					{
++						this._block.Entities.Add(extensionLine(extStart, extEnd, this.ActiveStyle, this.ActiveStyle.LineTypeExt1));
++					}
++				}
+ 			}
+ 
+-			string text = this.GetMeasurementText();
+-			if (!this.IsTextUserDefinedLocation)
++			if (!this.ActiveStyle.SuppressSecondExtensionLine)
+ 			{
+-				this.TextMiddlePoint = (textRef + gap * vec);
++				{
++					XYZ extStart = this.SecondPoint + thisexo * vec;
++					XYZ extEnd = dimRef2 + thisexe * vec;
++					// F2D: 측정점이 치수선 위에 있으면 방향이 0 벡터라 NaN 선이 생겼다 → 건너뜀
++					if (isFiniteLine(extStart, extEnd))
++					{
++						this._block.Entities.Add(extensionLine(extStart, extEnd, this.ActiveStyle, this.ActiveStyle.LineTypeExt2));
++					}
++				}
+ 			}
+ 
+-			MText mText = this.createTextEntity(this.TextMiddlePoint, text);
+-			this._block.Entities.Add(mText);
++			// F2D: 치수선·화살촉·문자 배치 (맞춤·문자 위치 규칙, Dimension.layoutLinearDimension)
++			this.layoutLinearDimension(dimRef1, dimRef2, (dimRef2 - dimRef1).Normalize());
+ 		}
+ 	}
+ }
+\ No newline at end of file
+diff --git a/src/ACadSharp/Entities/DimensionAngular2Line.cs b/src/ACadSharp/Entities/DimensionAngular2Line.cs
+index 47c926b3..75ce377c 100644
+--- a/src/ACadSharp/Entities/DimensionAngular2Line.cs
++++ b/src/ACadSharp/Entities/DimensionAngular2Line.cs
+@@ -1,4 +1,5 @@
+-﻿using ACadSharp.Attributes;
++﻿using System;
++using ACadSharp.Attributes;
+ using CSMath;
+ using CSMath.Extensions;
+ using CSMath.Geometry;
+@@ -29,11 +30,53 @@ namespace ACadSharp.Entities
+ 		{
+ 			get
+ 			{
+-				Line3D l1 = LineExtensions.CreateFromPoints<Line3D, XYZ>(this.DefinitionPoint, this.AngleVertex);
+-				Line3D l2 = LineExtensions.CreateFromPoints<Line3D, XYZ>(this.FirstPoint, this.SecondPoint);
++				// F2D: 두 무한 직선의 평면 교점 (Line3D.FindIntersection은 끝점이 맞닿는 경우 등에서 NaN을 돌려 치수가 그려지지 않았다)
++				XYZ a = this.FirstPoint, b = this.SecondPoint, c = this.AngleVertex, d = this.DefinitionPoint;
++				double rx = b.X - a.X, ry = b.Y - a.Y, sx = d.X - c.X, sy = d.Y - c.Y;
++				double den = rx * sy - ry * sx;
++				double scale = (Math.Abs(rx) + Math.Abs(ry)) * (Math.Abs(sx) + Math.Abs(sy));
++				if (Math.Abs(den) <= 1e-12 * Math.Max(scale, 1e-300))
++				{
++					return new XYZ(double.NaN, double.NaN, double.NaN);
++				}
++				double t = ((c.X - a.X) * sy - (c.Y - a.Y) * sx) / den;
++				return new XYZ(a.X + rx * t, a.Y + ry * t, a.Z);
++			}
++		}
+ 
+-				return l1.FindIntersection(l2);
++		/// <summary>
++		/// F2D: 호 점(DimensionArc)을 품는 부채꼴의 두 반직선 방향 (교점에서 바깥쪽, 단위 벡터).
++		/// 두 선이 만드는 네 부채꼴 중 하나 — 치수 값과 블록이 같은 부채꼴을 쓴다.
++		/// </summary>
++		internal (XYZ D1, XYZ D2)? Sector()
++		{
++			XYZ c = this.Center;
++			if (double.IsNaN(c.X))
++			{
++				return null;
+ 			}
++			XYZ r1 = (this.SecondPoint - this.FirstPoint).Normalize();
++			XYZ r2 = (this.DefinitionPoint - this.AngleVertex).Normalize();
++			XYZ va = this.DimensionArc - c;
++			XYZ n = this.Normal;
++			if (va.IsZero())
++			{
++				return (r1, r2);
++			}
++			foreach (int s1 in new[] { 1, -1 })
++			{
++				foreach (int s2 in new[] { 1, -1 })
++				{
++					XYZ a = s1 * r1, b = s2 * r2;
++					double cab = XYZ.Cross(a, b).Dot(n);
++					double cav = XYZ.Cross(a, va).Dot(n), cvb = XYZ.Cross(va, b).Dot(n);
++					if (cab > 0 && cav >= 0 && cvb >= 0 || cab < 0 && cav <= 0 && cvb <= 0)
++					{
++						return (a, b);
++					}
++				}
++			}
++			return (r1, r2);
+ 		}
+ 
+ 		/// <summary>
+@@ -53,27 +96,14 @@ namespace ACadSharp.Entities
+ 		{
+ 			get
+ 			{
++				// F2D: 호가 놓인 부채꼴의 각도 (기존 CAD와 같음)
++				if (this.Sector() is { } sec)
++				{
++					return sec.D1.AngleBetweenVectors(sec.D2);
++				}
+ 				var v1 = this.SecondPoint - this.FirstPoint;
+ 				var v2 = this.DefinitionPoint - this.AngleVertex;
+-				var angle = v1.AngleBetweenVectors(v2);
+-
+-				var vArc = this.DimensionArc - this.Center;
+-				if (vArc.IsZero())
+-					return angle;
+-
+-				var cross1 = XYZ.Cross(v1, vArc);
+-				var cross2 = XYZ.Cross(vArc, v2);
+-
+-				// Check if both cross products point in the same direction as the normal
+-				// This means vArc is in the sector between v1 and v2 (going counterclockwise)
+-				var dot1 = cross1.Dot(this.Normal);
+-				var dot2 = cross2.Dot(this.Normal);
+-
+-				var isInOppositeSector = (dot1 < 0 && dot2 > 0) || (dot1 > 0 && dot2 < 0);
+-				if (isInOppositeSector)
+-					angle = MathHelper.PI - angle;
+-
+-				return angle;
++				return v1.AngleBetweenVectors(v2);
+ 			}
+ 		}
+ 
+@@ -137,28 +167,24 @@ namespace ACadSharp.Entities
+ 		/// </remarks>
+ 		public override void UpdateBlock()
+ 		{
+-			//Needs a lot more investigation
+-			return;
+-
++			// F2D: 두 선의 교점에서 호 점이 있는 쪽 부채꼴을 잰다 (전에는 블록을 만들지 않아 각도 치수가 보이지 않았다)
+ 			base.UpdateBlock();
+ 
+-			var v1 = this.SecondPoint - this.FirstPoint;
+-			var v2 = this.DefinitionPoint - this.AngleVertex;
+-
+-			this._block.Entities.Add(createDefinitionPoint(FirstPoint));
+-			this._block.Entities.Add(createDefinitionPoint(SecondPoint));
+-			this._block.Entities.Add(createDefinitionPoint(AngleVertex));
+-			this._block.Entities.Add(createDefinitionPoint(DefinitionPoint));
+-
+-			if (this.Center.IsNaN())
++			XYZ c = this.Center;
++			if (c.IsNaN())
+ 			{
+ 				return;
+ 			}
+-
+-			var startAngle = XYZ.AxisX.AngleBetweenVectors(this.AngleVertex);
+-			var endAngle = XYZ.AxisX.AngleBetweenVectors(this.FirstPoint);
+-
+-			this._block.Entities.Add(new Arc(this.Center, this.Offset, startAngle, endAngle));
++			if (this.Sector() is not { } sec)
++			{
++				return;
++			}
++			XYZ best1 = sec.D1, best2 = sec.D2;
++			double Proj(XYZ p, XYZ d) => (p - c).Dot(d);
++			double t1a = Proj(this.FirstPoint, best1), t1b = Proj(this.SecondPoint, best1);
++			double t2a = Proj(this.AngleVertex, best2), t2b = Proj(this.DefinitionPoint, best2);
++			this.buildAngularBlock(c, best1, Math.Max(Math.Min(t1a, t1b), 0), Math.Max(Math.Max(t1a, t1b), 0),
++				best2, Math.Max(Math.Min(t2a, t2b), 0), Math.Max(Math.Max(t2a, t2b), 0), this.DimensionArc);
+ 		}
+ 	}
+ }
+\ No newline at end of file
+diff --git a/src/ACadSharp/Entities/DimensionAngular3Pt.cs b/src/ACadSharp/Entities/DimensionAngular3Pt.cs
+index 04adfe66..c8e2e250 100644
+--- a/src/ACadSharp/Entities/DimensionAngular3Pt.cs
++++ b/src/ACadSharp/Entities/DimensionAngular3Pt.cs
+@@ -89,7 +89,21 @@ namespace ACadSharp.Entities
+ 		/// </remarks>
+ 		public override void UpdateBlock()
+ 		{
++			// F2D: 꼭짓점·두 점으로 각도 치수 블록 (호 위치 = DefinitionPoint)
+ 			base.UpdateBlock();
++			XYZ c = this.AngleVertex;
++			XYZ v1 = this.FirstPoint - c, v2 = this.SecondPoint - c;
++			double l1 = v1.GetLength(), l2 = v2.GetLength();
++			if (l1 < 1e-12 || l2 < 1e-12)
++			{
++				return;
++			}
++			XYZ arc = this.DefinitionPoint;
++			if ((arc - c).GetLength() < 1e-12)
++			{
++				arc = c + (v1.Normalize() + v2.Normalize()).Normalize() * Math.Max(l1, l2);
++			}
++			this.buildAngularBlock(c, v1.Normalize(), 0, l1, v2.Normalize(), 0, l2, arc);
+ 		}
+ 
+ 		/// <inheritdoc/>
+diff --git a/src/ACadSharp/Entities/DimensionArc.cs b/src/ACadSharp/Entities/DimensionArc.cs
+index 488e16b8..861b6c82 100644
+--- a/src/ACadSharp/Entities/DimensionArc.cs
++++ b/src/ACadSharp/Entities/DimensionArc.cs
+@@ -1,4 +1,4 @@
+-using ACadSharp.Attributes;
++﻿using ACadSharp.Attributes;
+ using ACadSharp.Classes;
+ using CSMath;
+ using CSMath.Extensions;
+@@ -69,6 +69,14 @@ public class DimensionArc : Dimension, IDxfClassDefined
+ 
+ 			double radius = v1.GetLength();
+ 
++			// F2D: 시작·끝 각도가 있으면 반시계 사이각 (180° 넘는 호도 바르게)
++			if (Math.Abs(this.EndAngle - this.StartAngle) > 1e-12)
++			{
++				double sweep = (this.EndAngle - this.StartAngle) % (2 * Math.PI);
++				if (sweep < 0) sweep += 2 * Math.PI;
++				return radius * sweep;
++			}
++
+ 			if (v1.Equals(v2))
+ 			{
+ 				return 0.0;
+@@ -125,6 +133,18 @@ public class DimensionArc : Dimension, IDxfClassDefined
+ 	public override void UpdateBlock()
+ 	{
+ 		base.UpdateBlock();
++
++		// F2D: 호 길이 치수 블록 (각도 치수와 같은 호·화살표·보조선, 문자는 길이 + 호 기호)
++		var v1 = this.FirstPoint - this.Center;
++		var v2 = this.SecondPoint - this.Center;
++		double r = v1.GetLength();
++		if (r < 1e-12 || v2.GetLength() < 1e-12)
++		{
++			return;
++		}
++		var d1 = v1.Normalize();
++		var d2 = v2.Normalize();
++		this.buildAngularBlock(this.Center, d1, r, r, d2, r, r, this.DefinitionPoint);
+ 	}
+ 
+ 	/// <inheritdoc/>
+diff --git a/src/ACadSharp/Entities/DimensionDiameter.cs b/src/ACadSharp/Entities/DimensionDiameter.cs
+index efec14e2..e268d829 100644
+--- a/src/ACadSharp/Entities/DimensionDiameter.cs
++++ b/src/ACadSharp/Entities/DimensionDiameter.cs
+@@ -83,7 +83,7 @@ namespace ACadSharp.Entities
+ 			XY ref1 = this.AngleVertex.Convert<XY>();
+ 			XY defPoint = this.DefinitionPoint.Convert<XY>();
+ 
+-			double minOffset = (2 * this.Style.ArrowSize + this.Style.DimensionLineGap) * this.Style.ScaleFactor;
++			double minOffset = (2 * this.ActiveStyle.ArrowSize + this.ActiveStyle.DimensionLineGap) * this.ActiveStyle.ScaleFactor;
+ 			//this.angularBlock(radius, centerRef, ref1, minOffset, true);
+ 
+ 			//return;
+@@ -109,35 +109,46 @@ namespace ACadSharp.Entities
+ 				inside = 1;
+ 			}
+ 
+-			XY dimRef = XY.Polar(defPoint, offset - this.Style.DimensionLineGap * this.Style.ScaleFactor, angleRef);
++			XY dimRef = XY.Polar(defPoint, offset - this.ActiveStyle.DimensionLineGap * this.ActiveStyle.ScaleFactor, angleRef);
+ 
+ 			// reference points
+ 			Layer defPoints = Layer.Defpoints;
+ 			this._block.Entities.Add(new Point(ref1.Convert<XYZ>()) { Layer = defPoints });
+ 
++			// F2D: 바깥 수평 문자는 기존 CAD처럼 지시선 + 받침선 (원 위 화살촉 하나)
++			if (this.radialLanding(centerRef, ref1, angleRef, inside, this.radialText()))
++			{
++				if (!this.ActiveStyle.CenterMarkSize.IsZero())
++				{
++					this._block.Entities.AddRange(centerCross(this.Center, radius, this.ActiveStyle));
++				}
++				return;
++			}
++
+ 			// dimension lines
+-			if (!this.Style.SuppressFirstDimensionLine && !this.Style.SuppressSecondDimensionLine)
++			if (!this.ActiveStyle.SuppressFirstDimensionLine && !this.ActiveStyle.SuppressSecondDimensionLine)
+ 			{
+ 				if (inside > 0)
+ 				{
+ 					this._block.Entities.Add(dimensionRadialLine(dimRef, ref1, angleRef, (short)inside));
+-					//End Arrow
++					// F2D: 화살촉 (지름: 원 위 점에서 바깥쪽)
++					this._block.Entities.Add(this.radialArrow(ref1, angleRef, inside));
+ 				}
+ 				else
+ 				{
+ 					this._block.Entities.Add(dimensionRadialLine(dimRef, ref1, angleRef, inside));
+-					//End Arrow
++					this._block.Entities.Add(this.radialArrow(ref1, angleRef, inside));
+ 				}
+ 			}
+ 
+ 			// center cross
+-			if (!this.Style.CenterMarkSize.IsZero())
++			if (!this.ActiveStyle.CenterMarkSize.IsZero())
+ 			{
+-				this._block.Entities.AddRange(centerCross(this.Center, radius, this.Style));
++				this._block.Entities.AddRange(centerCross(this.Center, radius, this.ActiveStyle));
+ 			}
+ 
+ 			// dimension text
+-			var text = this.Measurement.ToString("#.##");//Provisional
++			var text = this.GetMeasurementText(); // F2D: 치수 스타일 형식과 Ø 접두 (예전: 임시 #.##)
+ 
+ 			double textRot = angleRef;
+ 			short reverse = 1;
+@@ -149,7 +160,7 @@ namespace ACadSharp.Entities
+ 
+ 			if (!this.IsTextUserDefinedLocation)
+ 			{
+-				XY textPos = XY.Polar(ref1, -reverse * inside * this.Style.DimensionLineGap * this.Style.ScaleFactor, textRot);
++				XY textPos = XY.Polar(ref1, -reverse * inside * this.ActiveStyle.DimensionLineGap * this.ActiveStyle.ScaleFactor, textRot);
+ 				this.TextMiddlePoint = textPos.Convert<XYZ>();
+ 			}
+ 
+diff --git a/src/ACadSharp/Entities/DimensionLargeRadial.cs b/src/ACadSharp/Entities/DimensionLargeRadial.cs
+new file mode 100644
+index 00000000..9874b1f8
+--- /dev/null
++++ b/src/ACadSharp/Entities/DimensionLargeRadial.cs
+@@ -0,0 +1,148 @@
++﻿using ACadSharp.Attributes;
++using ACadSharp.Classes;
++using ACadSharp.Tables;
++using CSMath;
++using CSMath.Extensions;
++using System;
++
++namespace ACadSharp.Entities;
++
++/// <summary>
++/// F2D: 꺾기 반지름 치수 (LARGE_RADIAL_DIMENSION, AcDbRadialDimensionLarge). 기존 CAD의 DIMJOGGED가 만드는 객체.
++/// DefinitionPoint = 원 중심(10), ChordPoint = 원 위의 점(15), OverrideCenter = 재정의 중심(13), JogPoint = 꺾기 위치(14).
++/// </summary>
++[DxfName(DxfFileToken.EntityLargeRadialDimension)]
++[DxfSubClass(DxfSubclassMarker.LargeRadialDimension)]
++public class DimensionLargeRadial : Dimension, IDxfClassDefined
++{
++	/// <summary>원 위의 점 (치수선이 원과 만나는 점).</summary>
++	[DxfCodeValue(15, 25, 35)]
++	public XYZ ChordPoint { get; set; }
++
++	/// <summary>재정의 중심 (치수선이 시작하는 점).</summary>
++	[DxfCodeValue(13, 23, 33)]
++	public XYZ OverrideCenter { get; set; }
++
++	/// <summary>꺾기 위치.</summary>
++	[DxfCodeValue(14, 24, 34)]
++	public XYZ JogPoint { get; set; }
++
++	[DxfCodeValue(40)]
++	public double LeaderLength { get; set; }
++
++	/// <summary>꺾기 각도 (DIMJOGANG, 기본 45°).</summary>
++	public double JogAngle { get; set; } = Math.PI / 4;
++
++	public override double Measurement => this.DefinitionPoint.DistanceFrom(this.ChordPoint);
++
++	public override string ObjectName => DxfFileToken.EntityLargeRadialDimension;
++
++	public override ObjectType ObjectType => ObjectType.UNLISTED;
++
++	public override string SubclassMarker => DxfSubclassMarker.LargeRadialDimension;
++
++	public DimensionLargeRadial() : base((DimensionType)9)
++	{
++	}
++
++	public override void ApplyTransform(Transform transform)
++	{
++		base.ApplyTransform(transform);
++		this.ChordPoint = transform.ApplyTransform(this.ChordPoint);
++		this.OverrideCenter = transform.ApplyTransform(this.OverrideCenter);
++		this.JogPoint = transform.ApplyTransform(this.JogPoint);
++	}
++
++	public override BoundingBox GetBoundingBox() => BoundingBox.FromPoints(new[] { this.ChordPoint, this.OverrideCenter, this.JogPoint, this.TextMiddlePoint });
++
++	public DxfClass GetDxfClass()
++	{
++		return new DxfClass
++		{
++			ApplicationName = "ObjectDBX Classes",
++			CppClassName = DxfSubclassMarker.LargeRadialDimension,
++			DwgVersion = ACadVersion.AC1015,
++			DxfName = DxfFileToken.EntityLargeRadialDimension,
++			ItemClassId = 498,
++			MaintenanceVersion = 0,
++			ProxyFlags = ProxyFlags.EraseAllowed | ProxyFlags.DisablesProxyWarningDialog,
++			WasZombie = false,
++		};
++	}
++
++	/// <summary>
++	/// 블록 (기존 CAD와 같은 모양): 재정의 중심 → 치수선에 평행하게 A까지, A → 꺾기점(DIMJOGANG 사선),
++	/// 꺾기점 → 원 위 점(화살촉). 문자는 치수선에 정렬되어 위쪽(DIMTAD), 원 밖이면 치수선을 문자까지 연장.
++	/// </summary>
++	public override void UpdateBlock()
++	{
++		base.UpdateBlock();
++		var style = this.ActiveStyle;
++		double scale = style.ScaleFactor > 0 ? style.ScaleFactor : 1.0;
++		double h = style.TextHeight * scale;
++		double asz = style.ArrowSize * scale;
++		double gap = Math.Abs(style.DimensionLineGap) * scale;
++		XYZ c = this.DefinitionPoint, p = this.ChordPoint;
++		double r = c.DistanceFrom(p);
++		if (r < 1e-12)
++		{
++			return;
++		}
++		XY u = new XY((p.X - c.X) / r, (p.Y - c.Y) / r); // 중심 → 원 위 점
++		XY n = new XY(-u.Y, u.X);
++		XY At(double along, double side) => new XY(c.X + u.X * along + n.X * side, c.Y + u.Y * along + n.Y * side);
++
++		double t = (this.JogPoint.X - c.X) * u.X + (this.JogPoint.Y - c.Y) * u.Y;
++		XY jog = At(t, 0);
++		double off = (this.OverrideCenter.X - c.X) * n.X + (this.OverrideCenter.Y - c.Y) * n.Y;
++		double ang = this.JogAngle > 0.05 ? this.JogAngle : Math.PI / 4;
++		XY a = At(t + Math.Abs(off) / Math.Tan(ang), off);
++
++		Line Ln(XY s0, XY s1) => new Line(new XYZ(s0.X, s0.Y, 0), new XYZ(s1.X, s1.Y, 0))
++		{
++			Color = style.DimensionLineColor,
++			LineWeight = style.DimensionLineWeight,
++		};
++		this._block.Entities.Add(Ln(new XY(this.OverrideCenter.X, this.OverrideCenter.Y), a));
++		this._block.Entities.Add(Ln(jog, a));
++
++		XY tm = new XY(this.TextMiddlePoint.X, this.TextMiddlePoint.Y);
++		if (!this.IsTextUserDefinedLocation)
++		{
++			tm = new XY(p.X, p.Y);
++			this.TextMiddlePoint = p;
++		}
++		double tAlong = (tm.X - c.X) * u.X + (tm.Y - c.Y) * u.Y;
++		double end = tAlong > r + 1e-9 ? tAlong : r - asz; // 문자가 원 밖이면 치수선을 문자까지
++		this._block.Entities.Add(Ln(jog, At(end, 0)));
++		this._block.Entities.Add(this.dimensionArrow(p, new XYZ(u.X, u.Y, 0), style, SecondArrowBlock(style)));
++
++		string text = this.GetMeasurementText(); // F2D: 문자 재정의(<>)는 GetMeasurementText가 처리
++		double rot = Math.Atan2(u.Y, u.X);
++		XY up = n;
++		if (style.TextOutsideHorizontal)
++		{
++			rot = 0;
++			up = new XY(0, 1);
++		}
++		else if (Math.Cos(rot) < -1e-9 || (Math.Abs(Math.Cos(rot)) <= 1e-9 && Math.Sin(rot) < 0))
++		{
++			rot += Math.PI; // 읽기 방향 유지
++			up = new XY(-n.X, -n.Y);
++		}
++		double lift = gap + h / 2;
++		MText mText = this.createTextEntity(new XYZ(tm.X + up.X * lift, tm.Y + up.Y * lift, 0), text);
++		mText.Height = h;
++		mText.AttachmentPoint = AttachmentPointType.MiddleCenter;
++		mText.AlignmentPoint = new XYZ(Math.Cos(rot), Math.Sin(rot), 0);
++		mText.Color = style.TextColor;
++		if (style.Style != null)
++		{
++			mText.Style = style.Style;
++		}
++		this._block.Entities.Add(mText);
++		this._block.Entities.Add(this.createDefinitionPoint(p));
++		this._block.Entities.Add(this.createDefinitionPoint(this.OverrideCenter));
++		this._block.Entities.Add(this.createDefinitionPoint(new XYZ(jog.X, jog.Y, 0)));
++	}
++}
+diff --git a/src/ACadSharp/Entities/DimensionLinear.cs b/src/ACadSharp/Entities/DimensionLinear.cs
+index d1d5dd93..70157f37 100644
+--- a/src/ACadSharp/Entities/DimensionLinear.cs
++++ b/src/ACadSharp/Entities/DimensionLinear.cs
+@@ -63,6 +63,9 @@ public class DimensionLinear : DimensionAligned
+ 	/// <inheritdoc/>
+ 	public override string SubclassMarker => DxfSubclassMarker.LinearDimension;
+ 
++	/// <inheritdoc/>
++	protected override XYZ measurementOrigin() => this.FirstPoint;
++
+ 	/// <inheritdoc/>
+ 	public DimensionLinear() : base(DimensionType.Linear)
+ 	{
+@@ -77,10 +80,8 @@ public class DimensionLinear : DimensionAligned
+ 		XYZ yVec = transform.ApplyTransform(XYZ.AxisY).Normalize();
+ 		XYZ xVec = transform.ApplyTransform(XYZ.AxisX).Normalize();
+ 
+-		Line3D line1 = new Line3D(this.FirstPoint, yVec);
+-		Line3D line2 = new Line3D(this.DefinitionPoint, xVec);
+-
+-		var dimRef1 = line1.FindIntersection(line2);
++		// F2D: 첫 점을 치수선에 투영 (Line3D.FindIntersection은 회전 치수 등에서 NaN을 돌려 치수선이 사라졌다)
++		var dimRef1 = this.DefinitionPoint + xVec * (this.FirstPoint - this.DefinitionPoint).Dot(xVec);
+ 		var dimRef2 = this.DefinitionPoint;
+ 		XYZ dir = (dimRef2 - dimRef1).Normalize();
+ 
+@@ -90,46 +91,39 @@ public class DimensionLinear : DimensionAligned
+ 		this._block.Entities.Add(new Point(dimRef1) { Layer = Layer.Defpoints });
+ 		this._block.Entities.Add(new Point(dimRef2) { Layer = Layer.Defpoints });
+ 
+-		if (!this.Style.SuppressFirstDimensionLine && !this.Style.SuppressSecondDimensionLine)
+-		{
+-			// dimension line
+-			this._block.Entities.Add(dimensionLine(dimRef1, dimRef2, this.Style));
+-			this._block.Entities.Add(dimensionArrow(dimRef1, -dir, this.Style, this.Style.DimArrow1));
+-			this._block.Entities.Add(dimensionArrow(dimRef2, dir, this.Style, this.Style.DimArrow2));
+-		}
+ 
+ 		// extension lines
+ 		var dirRef1 = (dimRef1 - this.FirstPoint).Normalize();
+ 		var dirRef2 = (dimRef2 - this.SecondPoint).Normalize();
+-		double dimexo = this.Style.ExtensionLineOffset * this.Style.ScaleFactor;
+-		double dimexe = this.Style.ExtensionLineExtension * this.Style.ScaleFactor;
+-		if (!this.Style.SuppressFirstExtensionLine)
+-		{
+-			this._block.Entities.Add(extensionLine(this.FirstPoint + dimexo * dirRef1, dimRef1 + dimexe * dirRef1, this.Style, this.Style.LineTypeExt1));
+-		}
+-
+-		if (!this.Style.SuppressSecondExtensionLine)
+-		{
+-			this._block.Entities.Add(extensionLine(this.SecondPoint + dimexo * dirRef2, dimRef2 + dimexe * dirRef2, this.Style, this.Style.LineTypeExt2));
+-		}
+-
+-		// dimension text
+-		var textRef = dimRef1.Mid(dimRef2);
+-		double gap = this.Style.DimensionLineGap * this.Style.ScaleFactor;
+-		double textRot = (double)this.Rotation;
+-		if (textRot > MathHelper.HalfPI && textRot <= MathHelper.ThreeHalfPI)
++		double dimexo = this.ActiveStyle.ExtensionLineOffset * this.ActiveStyle.ScaleFactor;
++		double dimexe = this.ActiveStyle.ExtensionLineExtension * this.ActiveStyle.ScaleFactor;
++		if (!this.ActiveStyle.SuppressFirstExtensionLine)
+ 		{
+-			gap = -gap;
+-			textRot += Math.PI;
++			{
++				XYZ extStart = this.FirstPoint + dimexo * dirRef1;
++				XYZ extEnd = dimRef1 + dimexe * dirRef1;
++				// F2D: 측정점이 치수선 위에 있으면 방향이 0 벡터라 NaN 선이 생겼다 → 건너뜀
++				if (isFiniteLine(extStart, extEnd))
++				{
++					this._block.Entities.Add(extensionLine(extStart, extEnd, this.ActiveStyle, this.ActiveStyle.LineTypeExt1));
++				}
++			}
+ 		}
+ 
+-		string text = this.GetMeasurementText();
+-		if (!this.IsTextUserDefinedLocation)
++		if (!this.ActiveStyle.SuppressSecondExtensionLine)
+ 		{
+-			this.TextMiddlePoint = (textRef + gap * yVec).Convert<XYZ>();
++			{
++				XYZ extStart = this.SecondPoint + dimexo * dirRef2;
++				XYZ extEnd = dimRef2 + dimexe * dirRef2;
++				// F2D: 측정점이 치수선 위에 있으면 방향이 0 벡터라 NaN 선이 생겼다 → 건너뜀
++				if (isFiniteLine(extStart, extEnd))
++				{
++					this._block.Entities.Add(extensionLine(extStart, extEnd, this.ActiveStyle, this.ActiveStyle.LineTypeExt2));
++				}
++			}
+ 		}
+ 
+-		MText mText = this.createTextEntity(this.TextMiddlePoint, text);
+-		this._block.Entities.Add(mText);
++		// F2D: 치수선·화살촉·문자 배치 (맞춤·문자 위치 규칙, Dimension.layoutLinearDimension)
++		this.layoutLinearDimension(dimRef1, dimRef2, dir);
+ 	}
+ }
+\ No newline at end of file
+diff --git a/src/ACadSharp/Entities/DimensionOrdinate.cs b/src/ACadSharp/Entities/DimensionOrdinate.cs
+index 3f42d1b0..a2d582fd 100644
+--- a/src/ACadSharp/Entities/DimensionOrdinate.cs
++++ b/src/ACadSharp/Entities/DimensionOrdinate.cs
+@@ -104,10 +104,10 @@ namespace ACadSharp.Entities
+ 			base.UpdateBlock();
+ 
+ 			var dim = this;
+-			DimensionStyle style = this.Style;
++			DimensionStyle style = this.ActiveStyle;
+ 
+ 			double measure = dim.Measurement;
+-			double minOffset = 2 * dim.Style.ArrowSize;
++			double minOffset = 2 * dim.ActiveStyle.ArrowSize;
+ 			XY ref1 = dim.FeatureLocation.Convert<XY>();
+ 			XY ref2 = dim.LeaderEndpoint.Convert<XY>();
+ 			XY refDim = ref2 - ref1;
+diff --git a/src/ACadSharp/Entities/DimensionRadius.cs b/src/ACadSharp/Entities/DimensionRadius.cs
+index 90d708f8..1f169c9a 100644
+--- a/src/ACadSharp/Entities/DimensionRadius.cs
++++ b/src/ACadSharp/Entities/DimensionRadius.cs
+@@ -71,7 +71,7 @@ namespace ACadSharp.Entities
+ 			double offset = this.DefinitionPoint.DistanceFrom(this.TextMiddlePoint);
+ 			XY centerRef = this.DefinitionPoint.Convert<XY>();
+ 			XY ref1 = this.AngleVertex.Convert<XY>();
+-			double minOffset = 2 * this.Style.ArrowSize * this.Style.ScaleFactor;
++			double minOffset = 2 * this.ActiveStyle.ArrowSize * this.ActiveStyle.ScaleFactor;
+ 
+ 			this.angularBlock(this.Measurement, centerRef, ref1, minOffset, false);
+ 		}
+diff --git a/src/ACadSharp/Entities/Insert.cs b/src/ACadSharp/Entities/Insert.cs
+index ff56f334..f656c88a 100644
+--- a/src/ACadSharp/Entities/Insert.cs
++++ b/src/ACadSharp/Entities/Insert.cs
+@@ -36,6 +36,22 @@ public class Insert : Entity, IOrientable
+ 	[DxfCodeValue(DxfReferenceType.Name, 2)]
+ 	public BlockRecord Block { get; internal set; }
+ 
++	/// <summary>
++	/// F2D: 다른 블록 정의로 바꾼다 (속성창 "이름"). 같은 도면의 블록 레코드만 (도면에 없으면 예외). 속성 값은 그대로 둔다.
++	/// </summary>
++	public void ReplaceBlock(BlockRecord block)
++	{
++		if (block == null)
++		{
++			throw new ArgumentNullException(nameof(block));
++		}
++		if (this.Document != null && block.Document != this.Document)
++		{
++			throw new ArgumentException("The block must belong to the same document.", nameof(block));
++		}
++		this.Block = block;
++	}
++
+ 	/// <summary>
+ 	/// Column count
+ 	/// </summary>
+diff --git a/src/ACadSharp/Entities/Leader.cs b/src/ACadSharp/Entities/Leader.cs
+index c7f90c4f..c13d4afb 100644
+--- a/src/ACadSharp/Entities/Leader.cs
++++ b/src/ACadSharp/Entities/Leader.cs
+@@ -35,7 +35,7 @@ public class Leader : Entity, IOrientable
+ 	/// Hard reference to associated annotation (mtext, tolerance, or insert entity).
+ 	/// </summary>
+ 	[DxfCodeValue(DxfReferenceType.Handle, 340)]
+-	public Entity AssociatedAnnotation { get; internal set; }
++	public Entity AssociatedAnnotation { get; set; } // F2D: 지시선 작성 시 주석 연결
+ 
+ 	/// <summary>
+ 	/// Offset of last leader vertex from block reference insertion point.
+@@ -107,6 +107,11 @@ public class Leader : Entity, IOrientable
+ 	[DxfCodeValue(72)]
+ 	public LeaderPathType PathType { get; set; }
+ 
++	/// <summary>
++	/// F2D: DSTYLE 재정의를 적용한 치수 스타일 (화살촉·색·크기). 재정의가 없으면 Style.
++	/// </summary>
++	public DimensionStyle GetActiveDimensionStyle() => Dimension.ActiveStyleOf(this, this.Style);
++
+ 	/// <summary>
+ 	/// Dimension Style.
+ 	/// </summary>
+diff --git a/src/ACadSharp/Entities/MText.cs b/src/ACadSharp/Entities/MText.cs
+index 405e0748..44354b10 100644
+--- a/src/ACadSharp/Entities/MText.cs
++++ b/src/ACadSharp/Entities/MText.cs
+@@ -113,7 +113,7 @@ public partial class MText : Entity, IText
+ 	/// Mtext line spacing style.
+ 	/// </summary>
+ 	[DxfCodeValue(73)]
+-	public LineSpacingStyleType LineSpacingStyle { get; set; }
++	public LineSpacingStyleType LineSpacingStyle { get; set; } = LineSpacingStyleType.AtLeast; //DWG 규격상 1 또는 2만 유효 (기존 CAD 기본값 1)
+ 
+ 	/// <inheritdoc/>
+ 	[DxfCodeValue(210, 220, 230)]
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgObjectReader.cs b/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgObjectReader.cs
+index 0765d7b9..a662c757 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgObjectReader.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgObjectReader.cs
+@@ -1465,6 +1465,29 @@ namespace ACadSharp.IO.DWG
+ 			return template;
+ 		}
+ 
++		private CadTemplate readDimLargeRadial()
++		{
++			DimensionLargeRadial dimension = new DimensionLargeRadial();
++			CadDimensionTemplate template = new CadDimensionTemplate(dimension);
++
++			this.readCommonDimensionData(template);
++
++			//Center 3BD 10
++			dimension.DefinitionPoint = this._objectReader.Read3BitDouble();
++			//Chord point 3BD 15
++			dimension.ChordPoint = this._objectReader.Read3BitDouble();
++			//Leader length BD 40
++			dimension.LeaderLength = this._objectReader.ReadBitDouble();
++			//Override center 3BD 13
++			dimension.OverrideCenter = this._objectReader.Read3BitDouble();
++			//Jog point 3BD 14
++			dimension.JogPoint = this._objectReader.Read3BitDouble();
++
++			this.readCommonDimensionHandles(template);
++
++			return template;
++		}
++
+ 		private CadTemplate readDimRadius()
+ 		{
+ 			DimensionRadius dimension = new DimensionRadius();
+@@ -5969,6 +5992,9 @@ namespace ACadSharp.IO.DWG
+ 				case DxfFileToken.EntityArcDimension:
+ 					template = this.readDimArc();
+ 					break;
++				case DxfFileToken.EntityLargeRadialDimension:
++					template = this.readDimLargeRadial();
++					break;
+ 				case DxfFileToken.ObjectBinRecord:  // Add this variant
+ 					template = this.readBinRecord();
+ 					break;
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgStreamReaderBase.cs b/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgStreamReaderBase.cs
+index 0319e633..2ce17647 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgStreamReaderBase.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamReaders/DwgStreamReaderBase.cs
+@@ -870,7 +870,24 @@ namespace ACadSharp.IO.DWG
+ 			}
+ 			else
+ 			{
+-				value = this.ReadString(textLength, TextEncoding.GetListedEncoding((CodePage)encodingKey));
++				// F2D: 파일에 든 값은 코드 페이지 번호가 아니라 목록 순번(예: ANSI_949 = 40) → 순번으로 코드 페이지를 찾는다
++				// (전에는 순번을 코드 페이지로 써서 R2004 이하 XRecord의 한글이 깨졌음)
++				var page = CadUtils.GetCodePage(encodingKey);
++				System.Text.Encoding enc = null;
++				if (page != CodePage.Unknown)
++				{
++					try
++					{
++#if !NET48
++						System.Text.Encoding.RegisterProvider(System.Text.CodePagesEncodingProvider.Instance);
++#endif
++						enc = System.Text.Encoding.GetEncoding((int)page);
++					}
++					catch (Exception)
++					{
++					}
++				}
++				value = this.ReadString(textLength, enc ?? this.Encoding ?? TextEncoding.Windows1252());
+ 			}
+ 
+ 			return value;
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgHeaderWriter.cs b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgHeaderWriter.cs
+index fd2dbff7..4d6e0945 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgHeaderWriter.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgHeaderWriter.cs
+@@ -1009,7 +1009,8 @@ namespace ACadSharp.IO.DWG
+ 				//RC : LIGHTGLYPHDISPLAY
+ 				this._writer.WriteByte((byte)this._header.DisplayLightGlyphs);
+ 				//RC : TILEMODELIGHTSYNCH	??
+-				this._writer.WriteByte((byte)'0');
++				// F2D: 문자 '0'(48)이 아니라 1 (기존 CAD AUDIT: 0..1 범위, 기본값 1)
++				this._writer.WriteByte(1);
+ 				//RC : DWFFRAME
+ 				this._writer.WriteByte((byte)this._header.DwgUnderlayFramesVisibility);
+ 				//RC : DGNFRAME
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Entities.cs b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Entities.cs
+index bea9d6be..59672e01 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Entities.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Entities.cs
+@@ -519,6 +519,13 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 					case DimensionArc arc:
+ 						this.writeDimensionArc(arc);
+ 						break;
++					case DimensionLargeRadial large:
++						this._writer.Write3BitDouble(large.DefinitionPoint);
++						this._writer.Write3BitDouble(large.ChordPoint);
++						this._writer.WriteBitDouble(large.LeaderLength);
++						this._writer.Write3BitDouble(large.OverrideCenter);
++						this._writer.Write3BitDouble(large.JogPoint);
++						break;
+ 					case DimensionDiameter diamenter:
+ 						this.writeDimensionDiameter(diamenter);
+ 						break;
+@@ -1078,7 +1085,7 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 		}
+ 
+ 		//H 340 Associated annotation
+-		this._writer.HandleReference(DwgReferenceType.HardPointer, null);
++		this._writer.HandleReference(DwgReferenceType.HardPointer, leader.AssociatedAnnotation);
+ 		//H 2 DIMSTYLE (hard pointer)
+ 		this._writer.HandleReference(DwgReferenceType.HardPointer, leader.Style);
+ 	}
+@@ -2406,7 +2413,89 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 		//	0x20: title suppressed.
+ 		//	Normally 0x06 is always set.
+ 
+-		throw new NotImplementedException();
++		// F2D: R2007 이하 표 쓰기 (읽기 코드 readTableEntity의 R2007 이하 부분과 같은 순서).
++		// 전에는 NotImplementedException으로 표가 통째로 빠져, 표가 있는 도면을 2004로 저장하면 표가 사라졌다.
++		this._writer.WriteBitShort((short)(table.ValueFlag != 0 ? table.ValueFlag : 0x06));
++		//Hor.Dir.Vector 3BD 11
++		this._writer.Write3BitDouble(table.HorizontalDirection == XYZ.Zero ? XYZ.AxisX : table.HorizontalDirection);
++		//Number of columns BL 92
++		this._writer.WriteBitLong(table.Columns.Count);
++		//Number of rows BL 91
++		this._writer.WriteBitLong(table.Rows.Count);
++		//Column widths BD 142
++		foreach (TableEntity.Column column in table.Columns)
++		{
++			this._writer.WriteBitDouble(column.Width);
++		}
++		//Row heights BD 141
++		foreach (TableEntity.Row row in table.Rows)
++		{
++			this._writer.WriteBitDouble(row.Height);
++		}
++		//H 342 Table Style ID (hard pointer)
++		this._writer.HandleReference(DwgReferenceType.HardPointer, table.Style);
++
++		//Cell data, repeats for all cells in n x m table
++		foreach (TableEntity.Row row in table.Rows)
++		{
++			for (int m = 0; m < table.Columns.Count; m++)
++			{
++				TableEntity.Cell cell = m < row.Cells.Count ? row.Cells[m] : new TableEntity.Cell { Type = TableEntity.CellType.Text };
++				this.writeTableCellDataR2007(cell);
++			}
++		}
++
++		//Has table overrides B
++		this._writer.WriteBit(false);
++		//Has border color overrides B
++		this._writer.WriteBit(false);
++		//Has border lineweight overrides B
++		this._writer.WriteBit(false);
++		//Has border visibility overrides B
++		this._writer.WriteBit(false);
++	}
++
++	/// <summary>F2D: R2007 이하 표 칸 (readTableCellData와 같은 순서). 칸 서식 재정의는 쓰지 않는다.</summary>
++	private void writeTableCellDataR2007(TableEntity.Cell cell)
++	{
++		// 블록 칸의 블록 참조는 읽을 때 보존되지 않으므로 문자 칸으로 쓴다
++		var type = TableEntity.CellType.Text;
++		//Cell type BS 171 1 = text, 2 = block.
++		this._writer.WriteBitShort((short)type);
++		//Cell edge flags RC 172
++		this._writer.WriteByte((byte)cell.EdgeFlags);
++		//Cell merged value B 173
++		this._writer.WriteBit(cell.MergedValue != 0);
++		//Autofit flag B 174
++		this._writer.WriteBit(cell.AutoFit);
++		//Merged width flag BL 175
++		this._writer.WriteBitLong(cell.BorderWidth);
++		//Merged height flag BL 176
++		this._writer.WriteBitLong(cell.BorderHeight);
++		//Rotation value BD 145
++		this._writer.WriteBitDouble(cell.Rotation);
++
++		{
++			//H 344 text (hard pointer): 0 → 문자열을 바로 뒤에
++			this._writer.HandleReference(DwgReferenceType.HardPointer, null);
++			if (this._version < ACadVersion.AC1021)
++			{
++				//Text string TV 1
++				this._writer.WriteVariableText(cell.Content?.CadValue?.Value?.ToString() ?? string.Empty);
++			}
++		}
++
++		//has override flag B
++		this._writer.WriteBit(false);
++
++		//R2007+:
++		if (this.R2007Plus)
++		{
++			//Unknown BL
++			this._writer.WriteBitLong(0);
++			//Value fields
++			this.writeCadValue(cell.Content?.CadValue ?? new CadValue());
++		}
+ 	}
+ 
+ 	private void writeTableContent(TableContent content)
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Objects.cs b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Objects.cs
+index 9cd5b527..142c7336 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Objects.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.Objects.cs
+@@ -2261,9 +2261,11 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 		}
+ 		else
+ 		{
+-			ms.Write<short>((short)text.Length);
++			// F2D: 길이는 바이트 수 (한글 등 2바이트 문자가 있으면 글자 수와 다르다 → 기존 CAD "Object improperly read")
++			byte[] bytes = this._writer.Encoding.GetBytes(text);
++			ms.Write<short>((short)bytes.Length);
+ 			ms.Write((byte)CadUtils.GetCodeIndex((CodePage)this._writer.Encoding.CodePage));
+-			ms.Write(text, this._writer.Encoding);
++			ms.WriteBytes(bytes);
+ 		}
+ 	}
+ 
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.cs b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.cs
+index b0b0b938..74239d76 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgObjectWriter.cs
+@@ -147,7 +147,7 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 				return false;
+ 			case Shape:
+ 				return this.WriteShapes;
+-			case TableEntity when !this.R2010Plus:
++			// F2D: R2007 이하 표 쓰기를 구현했으므로 표도 쓴다 (전에는 표가 사라졌다)
+ 			case Wall:
+ 			case MechanicalEntity:
+ 			case ProxyEntity:
+@@ -1149,7 +1149,8 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 							var encodingIndex = CadUtils.GetCodeIndex((CSUtilities.Text.CodePage)this._writer.Encoding.CodePage);
+ 							byte[] bytes = this._writer.Encoding.GetBytes(string.IsNullOrEmpty(str.Value) ? string.Empty : str.Value);
+ 
+-							mstream.Write(LittleEndianConverter.Instance.GetBytes((ushort)str.Value.Length), 0, 2);
++							//Length is the encoded byte count, not the char count (multi-byte code pages like ANSI_949)
++							mstream.Write(LittleEndianConverter.Instance.GetBytes((ushort)bytes.Length), 0, 2);
+ 							mstream.WriteByte((byte)encodingIndex);
+ 							mstream.Write(bytes, 0, bytes.Length);
+ 						}
+@@ -1559,7 +1560,8 @@ internal partial class DwgObjectWriter : DwgSectionIO
+ 		//Bigfont name TV 4
+ 		this._writer.WriteVariableText(style.BigFontFilename);
+ 
+-		this._writer.HandleReference(DwgReferenceType.HardPointer, this._document.TextStyles);
++		//External reference block handle (hard pointer), null when not xref dependent
++		this._writer.HandleReference(DwgReferenceType.HardPointer, 0);
+ 
+ 		this.registerObject(style);
+ 	}
+diff --git a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgStreamWriterBase.cs b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgStreamWriterBase.cs
+index 506baad0..ba4288df 100644
+--- a/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgStreamWriterBase.cs
++++ b/src/ACadSharp/IO/DWG/DwgStreamWriters/DwgStreamWriterBase.cs
+@@ -267,14 +267,55 @@ namespace ACadSharp.IO.DWG
+ 				return;
+ 			}
+ 
+-			byte[] bytes = this.Encoding.GetBytes(value);
++			byte[] bytes = this.Encoding.GetBytes(EscapeUnencodable(value, this.Encoding));
+ 			this.WriteBitShort((short)bytes.Length);
+ 			this.WriteBytes(bytes);
+ 		}
+ 
++		/// <summary>
++		/// F2D: 도면 코드 페이지에 없는 글자는 기존 CAD처럼 \U+XXXX로 (예: 지름 기호 ∅ → \U+2205, 예전에는 '?'로 깨짐).
++		/// </summary>
++		internal static string EscapeUnencodable(string value, Encoding encoding)
++		{
++			int i = 0;
++			while (i < value.Length && value[i] < 0x80)
++			{
++				i++;
++			}
++			if (i == value.Length || encoding.CodePage == Encoding.Unicode.CodePage || encoding.CodePage == Encoding.UTF8.CodePage)
++			{
++				return value;
++			}
++			var sb = new StringBuilder(value.Length + 8);
++			sb.Append(value, 0, i);
++			for (; i < value.Length; i++)
++			{
++				char ch = value[i];
++				if (ch < 0x80)
++				{
++					sb.Append(ch);
++					continue;
++				}
++				string one = char.IsHighSurrogate(ch) && i + 1 < value.Length ? value.Substring(i, 2) : ch.ToString();
++				if (encoding.GetString(encoding.GetBytes(one)) == one)
++				{
++					sb.Append(one);
++				}
++				else
++				{
++					foreach (char c in one)
++					{
++						sb.Append("\\U+").Append(((int)c).ToString("X4"));
++					}
++				}
++				i += one.Length - 1;
++			}
++			return sb.ToString();
++		}
++
+ 		public virtual void WriteTextUnicode(string value)
+ 		{
+-			byte[] bytes = this.Encoding.GetBytes(string.IsNullOrEmpty(value) ? string.Empty : value);
++			byte[] bytes = this.Encoding.GetBytes(string.IsNullOrEmpty(value) ? string.Empty : EscapeUnencodable(value, this.Encoding));
+ 			this.WriteRawShort((ushort)(bytes.Length + 1));
+ 			this._stream.Write(bytes, 0, bytes.Length);
+ 			this._stream.WriteByte(0);
+diff --git a/src/ACadSharp/IO/DXF/DxfStreamReader/DxfSectionReaderBase.cs b/src/ACadSharp/IO/DXF/DxfStreamReader/DxfSectionReaderBase.cs
+index 5f4a2c09..ded13359 100644
+--- a/src/ACadSharp/IO/DXF/DxfStreamReader/DxfSectionReaderBase.cs
++++ b/src/ACadSharp/IO/DXF/DxfStreamReader/DxfSectionReaderBase.cs
+@@ -167,6 +167,7 @@ internal abstract class DxfSectionReaderBase
+ 				return this.readEntityCodes<Circle>(new CadEntityTemplate<Circle>(), this.readCircle);
+ 			case DxfFileToken.EntityDimension:
+ 			case DxfFileToken.EntityArcDimension:
++			case DxfFileToken.EntityLargeRadialDimension:
+ 				var dimTemplate = this.readEntityCodes<Dimension>(new CadDimensionTemplate(), this.readDimension);
+ 				if (dimTemplate.CadObject is CadDimensionTemplate.DimensionPlaceholder)
+ 				{
+@@ -860,6 +861,10 @@ internal abstract class DxfSectionReaderBase
+ 						tmp.SetDimensionObject(new DimensionArc());
+ 						map.SubClasses.TryAdd(this._reader.ValueAsString, DxfClassMap.Create<DimensionArc>());
+ 						return true;
++					case DxfSubclassMarker.LargeRadialDimension:
++						tmp.SetDimensionObject(new DimensionLargeRadial());
++						map.SubClasses.TryAdd(this._reader.ValueAsString, DxfClassMap.Create<DimensionLargeRadial>());
++						return true;
+ 					case DxfSubclassMarker.RadialDimension:
+ 						tmp.SetDimensionObject(new DimensionRadius());
+ 						map.SubClasses.TryAdd(this._reader.ValueAsString, DxfClassMap.Create<DimensionRadius>());
+diff --git a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfAsciiWriter.cs b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfAsciiWriter.cs
+index bf41eda6..cc845066 100644
+--- a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfAsciiWriter.cs
++++ b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfAsciiWriter.cs
+@@ -58,7 +58,8 @@ internal class DxfAsciiWriter : DxfStreamWriterBase
+ 			case GroupCodeValueType.String:
+ 			case GroupCodeValueType.Comment:
+ 			case GroupCodeValueType.ExtendedDataString:
+-				this._stream.WriteLine(value.ToString());
++				// F2D: 코드 페이지 밖 글자는 \U+XXXX (DWG 쓰기와 같게)
++				this._stream.WriteLine(ACadSharp.IO.DWG.DwgStreamWriterBase.EscapeUnencodable(value.ToString(), this._stream.Encoding));
+ 				return;
+ 			case GroupCodeValueType.Point3D:
+ 			case GroupCodeValueType.Double:
+diff --git a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.Entities.cs b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.Entities.cs
+index eecf4819..aa2d60c6 100644
+--- a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.Entities.cs
++++ b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.Entities.cs
+@@ -336,6 +336,15 @@ internal abstract partial class DxfSectionWriterBase
+ 			case DimensionArc arc:
+ 				this.writeDimensionArc(arc);
+ 				break;
++			case DimensionLargeRadial large:
++				{
++					DxfClassMap lmap = DxfClassMap.Create<DimensionLargeRadial>();
++					this._writer.Write(DxfCode.Subclass, DxfSubclassMarker.LargeRadialDimension);
++					this._writer.Write(13, large.OverrideCenter, lmap);
++					this._writer.Write(14, large.JogPoint, lmap);
++					this._writer.Write(15, large.ChordPoint, lmap);
++					break;
++				}
+ 			case DimensionOrdinate ordinate:
+ 				this.writeDimensionOrdinate(ordinate);
+ 				break;
+@@ -693,7 +702,9 @@ internal abstract partial class DxfSectionWriterBase
+ 
+ 		this._writer.Write(71, leader.ArrowHeadEnabled ? (short)1 : (short)0, map);
+ 		this._writer.Write(72, (short)leader.PathType, map);
+-		this._writer.Write(73, (short)leader.CreationType, map);
++		// F2D: 주석(문자 등)이 연결되지 않은 지시선을 '주석 있음'으로 쓰면 기존 CAD AUDIT 오류 (Annotation enabled but Id is Null)
++		var creationType = leader.AssociatedAnnotation == null ? LeaderCreationType.CreatedWithoutAnnotation : leader.CreationType;
++		this._writer.Write(73, (short)creationType, map);
+ 		this._writer.Write(74, leader.HookLineDirection == HookLineDirection.Same ? (short)1 : (short)0, map);
+ 		this._writer.Write(75, leader.HasHookline ? (short)1 : (short)0, map);
+ 
+@@ -707,7 +718,10 @@ internal abstract partial class DxfSectionWriterBase
+ 		}
+ 
+ 		//this._writer.Write(77, leader,map);
+-		//this._writer.Write(340, leader.Annotation,map);
++		if (leader.AssociatedAnnotation != null)
++		{
++			this._writer.WriteHandle(340, leader.AssociatedAnnotation, map);
++		}
+ 
+ 		this._writer.Write(210, leader.Normal, map);
+ 
+@@ -725,6 +739,8 @@ internal abstract partial class DxfSectionWriterBase
+ 			this._writer.Write(10, point);
+ 		}
+ 		this._writer.Write(91, leaderLine.Index);
++		// F2D: 지시선 색 (기존 CAD가 쓰는 값, 빠지면 기존 CAD에서 지시선 색이 정해지지 않음)
++		this._writer.WriteCmColor(92, leaderLine.LineColor);
+ 
+ 		this._writer.Write(305, "}");   //	LEADER_Line
+ 	}
+diff --git a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.cs b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.cs
+index e88701cf..c74157a1 100644
+--- a/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.cs
++++ b/src/ACadSharp/IO/DXF/DxfStreamWriter/DxfSectionWriterBase.cs
+@@ -134,6 +134,13 @@ internal abstract partial class DxfSectionWriterBase
+ 
+ 		foreach (var entry in xdata)
+ 		{
++			// F2D: 버전 제한(R2000 이하는 이름 31자)으로 APPID 표에 쓰지 않은 앱의 확장 데이터는 건너뛴다
++			// (표에 없는 앱 이름을 쓰면 기존 CAD가 "Invalid RegApp"으로 도면을 열지 못했다)
++			if (!entry.Key.IsValid(CadFileFormat.DXF, this.Version))
++			{
++				continue;
++			}
++
+ 			this._writer.Write(DxfCode.ExtendedDataRegAppName, entry.Key.Name);
+ 
+ 			foreach (ExtendedDataRecord record in entry.Value.Records)
+diff --git a/src/ACadSharp/Objects/Collections/GroupCollection.cs b/src/ACadSharp/Objects/Collections/GroupCollection.cs
+index de602915..40b16c10 100644
+--- a/src/ACadSharp/Objects/Collections/GroupCollection.cs
++++ b/src/ACadSharp/Objects/Collections/GroupCollection.cs
+@@ -36,7 +36,7 @@ namespace ACadSharp.Objects.Collections
+ 					}
+ 				}
+ 
+-				entry.Name = $"*D{next++}";
++				entry.Name = $"*A{++next}"; // F2D: 기존 최대 번호와 겹치지 않게 (원래 next++ 로 중복 이름)
+ 			}
+ 
+ 			base.Add(entry);
+diff --git a/src/ACadSharp/XData/ExtendedDataDictionary.cs b/src/ACadSharp/XData/ExtendedDataDictionary.cs
+index 1a21b8c0..1800c77a 100644
+--- a/src/ACadSharp/XData/ExtendedDataDictionary.cs
++++ b/src/ACadSharp/XData/ExtendedDataDictionary.cs
+@@ -94,6 +94,15 @@ public class ExtendedDataDictionary : IEnumerable<KeyValuePair<AppId, ExtendedDa
+ 		this._data.Add(app, new ExtendedData(records));
+ 	}
+ 
++	/// <summary>
++	/// F2D: 이름으로 응용 프로그램의 확장 데이터를 지운다.
++	/// </summary>
++	public bool Remove(string name)
++	{
++		var key = this._data.Keys.FirstOrDefault(k => string.Equals(k.Name, name, StringComparison.OrdinalIgnoreCase));
++		return key != null && this._data.Remove(key);
++	}
++
+ 	/// <summary>
+ 	/// Clear all Dictionary entries.
+ 	/// </summary>

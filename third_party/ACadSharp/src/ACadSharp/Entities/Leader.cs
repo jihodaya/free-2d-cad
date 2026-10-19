@@ -1,0 +1,262 @@
+﻿using ACadSharp.Attributes;
+using ACadSharp.Tables;
+using ACadSharp.XData;
+using CSMath;
+using CSMath.Extensions;
+using System;
+using System.Collections.Generic;
+
+namespace ACadSharp.Entities;
+
+/// <summary>
+/// Represents a <see cref="Leader"/> entity.
+/// </summary>
+/// <remarks>
+/// Object name <see cref="DxfFileToken.EntityLeader"/> <br/>
+/// Dxf class name <see cref="DxfSubclassMarker.Leader"/>
+/// </remarks>
+[DxfName(DxfFileToken.EntityLeader)]
+[DxfSubClass(DxfSubclassMarker.Leader)]
+public class Leader : Entity, IOrientable
+{
+	/// <summary>
+	/// Offset of last leader vertex from annotation placement point.
+	/// </summary>
+	[DxfCodeValue(213, 223, 233)]
+	public XYZ AnnotationOffset { get; set; } = XYZ.Zero;
+
+	/// <summary>
+	/// Arrowhead flag.
+	/// </summary>
+	[DxfCodeValue(71)]
+	public bool ArrowHeadEnabled { get; set; }
+
+	/// <summary>
+	/// Hard reference to associated annotation (mtext, tolerance, or insert entity).
+	/// </summary>
+	[DxfCodeValue(DxfReferenceType.Handle, 340)]
+	public Entity AssociatedAnnotation { get; set; } // F2D: 지시선 작성 시 주석 연결
+
+	/// <summary>
+	/// Offset of last leader vertex from block reference insertion point.
+	/// </summary>
+	[DxfCodeValue(212, 222, 232)]
+	public XYZ BlockOffset { get; set; } = XYZ.Zero;
+
+	/// <summary>
+	/// Leader creation flag, AssociatedAnnotation type.
+	/// </summary>
+	/// <value>
+	/// 0 = mtext
+	/// 1 = tolerance
+	/// 2 = insert
+	/// 3 = none (default)
+	/// </value>
+	[DxfCodeValue(73)]
+	public LeaderCreationType CreationType { get; set; } = LeaderCreationType.CreatedWithoutAnnotation;
+
+	/// <summary>
+	/// Hook line flag.
+	/// </summary>
+	[DxfCodeValue(75)]
+	public bool HasHookline
+	{
+		get
+		{
+			bool result = false;
+			if (this.Vertices.Count <= 1)
+			{
+				return result;
+			}
+
+			double angle = (this.Vertices[this.Vertices.Count - 2] - this.Vertices[this.Vertices.Count - 1]).AngleBetweenVectors(this.HorizontalDirection);
+			return angle.IsZero();
+		}
+	}
+
+	/// <summary>
+	/// Hook line direction.
+	/// </summary>
+	[DxfCodeValue(74)]
+	public HookLineDirection HookLineDirection { get; set; }
+
+	/// <summary>
+	/// Horizontal direction for leader.
+	/// </summary>
+	[DxfCodeValue(211, 221, 231)]
+	public XYZ HorizontalDirection { get; set; } = XYZ.AxisX;
+
+	//77	Color to use if leader's DIMCLRD = BYBLOCK
+	/// <inheritdoc/>
+	[DxfCodeValue(210, 220, 230)]
+	public XYZ Normal { get; set; } = XYZ.AxisZ;
+
+	/// <inheritdoc/>
+	public override string ObjectName => DxfFileToken.EntityLeader;
+
+	/// <inheritdoc/>
+	public override ObjectType ObjectType => ObjectType.LEADER;
+
+	/// <summary>
+	/// Leader Path Type.
+	/// </summary>
+	/// <value>
+	/// 0 = straight lines
+	/// 1 = spline
+	/// </value>
+	[DxfCodeValue(72)]
+	public LeaderPathType PathType { get; set; }
+
+	/// <summary>
+	/// F2D: DSTYLE 재정의를 적용한 치수 스타일 (화살촉·색·크기). 재정의가 없으면 Style.
+	/// </summary>
+	public DimensionStyle GetActiveDimensionStyle() => Dimension.ActiveStyleOf(this, this.Style);
+
+	/// <summary>
+	/// Dimension Style.
+	/// </summary>
+	[DxfCodeValue(DxfReferenceType.Name, 3)]
+	public DimensionStyle Style
+	{
+		get { return this._style; }
+		set
+		{
+			if (value == null)
+			{
+				throw new ArgumentNullException(nameof(value));
+			}
+
+			this._style = this.updateTableEntry(value, s => this._style = s, this.Document?.DimensionStyles);
+		}
+	}
+
+	/// <inheritdoc/>
+	public override string SubclassMarker => DxfSubclassMarker.Leader;
+
+	/// <summary>
+	/// Text annotation height.
+	/// </summary>
+	[DxfCodeValue(40)]
+	public double TextHeight { get; set; }
+
+	/// <summary>
+	/// Text annotation width.
+	/// </summary>
+	[DxfCodeValue(41)]
+	public double TextWidth { get; set; }
+
+	/// <summary>
+	/// Vertices in leader.
+	/// </summary>
+	[DxfCodeValue(DxfReferenceType.Count, 76)]
+	[DxfCollectionCodeValue(10, 20, 30)]
+	public List<XYZ> Vertices { get; set; } = new List<XYZ>();
+
+	private DimensionStyle _style = DimensionStyle.Default;
+
+	/// <inheritdoc/>
+	public override void ApplyTransform(Transform transform)
+	{
+		this.Normal = this.transformNormal(transform, this.Normal);
+
+		for (int i = 0; i < this.Vertices.Count; i++)
+		{
+			this.Vertices[i] = transform.ApplyTransform(this.Vertices[i]);
+		}
+
+		this.HorizontalDirection = transform.ApplyRotation(this.HorizontalDirection).Normalize();
+	}
+
+	/// <inheritdoc/>
+	public override CadObject Clone()
+	{
+		Leader clone = (Leader)base.Clone();
+		clone.Style = (DimensionStyle)(this.Style?.Clone());
+		return clone;
+	}
+
+	/// <inheritdoc/>
+	public override BoundingBox GetBoundingBox()
+	{
+		return BoundingBox.FromPoints(this.Vertices);
+	}
+
+	/// <summary>
+	/// Applies the specified dimension style override to the current leader, updating its extended data
+	/// to reflect the overridden properties (e.g. arrowhead block, DIMLDRBLK = code 341).
+	/// </summary>
+	/// <remarks>
+	/// Only properties that differ between the leader's current style and <paramref name="styleOverride"/>
+	/// are serialised into the DSTYLE XDATA block, mirroring the behaviour of
+	/// <see cref="Dimension.SetDimensionOverride"/>.
+	/// </remarks>
+	/// <param name="styleOverride">
+	/// The dimension style whose values should override the leader's current style.
+	/// Only properties with values different from the current style are applied.
+	/// </param>
+	public void SetDimensionOverride(DimensionStyle styleOverride)
+	{
+		DxfClassMap styleMap = DxfClassMap.Create<DimensionStyle>();
+		styleMap.DxfProperties.Remove(2);   // name — not an override
+		styleMap.DxfProperties.Remove(70);  // flags — not an override
+
+		DxfClassMap overrideMap = new DxfClassMap();
+		foreach (KeyValuePair<int, DxfProperty> item in styleMap.DxfProperties)
+		{
+			var curr = item.Value.GetRawValue(this.Style);
+			var over = item.Value.GetRawValue(styleOverride);
+
+			// over=null means "reset to default": ToXDataRecords emits nothing for a null
+			// StoredValue, so skip to avoid adding a useless entry to the override map.
+			if (over == null)
+				continue;
+
+			// object.Equals handles curr=null safely:
+			//   (null, null)   → true  → already skipped above (over would be null)
+			//   (null, value)  → false → include (null→value: new assignment)
+			//   (value, value) → delegates to curr.Equals(over)
+			if (!object.Equals(curr, over))
+			{
+				item.Value.StoredValue = over;
+				overrideMap.DxfProperties.Add(item.Key, item.Value);
+			}
+		}
+
+		this.SetStyleOverrideMap(overrideMap);
+	}
+
+	/// <summary>
+	/// Sets the style override mapping for the current leader using the specified DXF class map,
+	/// writing the entries as <c>ACAD / DSTYLE / { … }</c> extended data.
+	/// </summary>
+	/// <param name="map">A DXF class map containing the property overrides to apply.</param>
+	public void SetStyleOverrideMap(DxfClassMap map)
+	{
+		ExtendedData edata = this.ExtendedData.TryAdd(AppId.DefaultName, new ExtendedData());
+		edata.Records.Clear();
+
+		edata.Records.Add(new ExtendedDataString(DimensionStyle.StyleOverrideEntryName));
+		edata.Records.Add(new ExtendedDataControlString(false));
+		foreach (DxfProperty p in map.DxfProperties.Values)
+		{
+			edata.Records.AddRange(p.ToXDataRecords());
+		}
+		edata.Records.Add(new ExtendedDataControlString(true));
+	}
+
+	internal override void AssignDocument(CadDocument doc)
+	{
+		base.AssignDocument(doc);
+
+		this._style = this.updateTableEntry(this._style, s => this._style = s, doc.DimensionStyles);
+	}
+
+	internal override void UnassignDocument()
+	{
+		this.Document.DimensionStyles.RemoveReference(this.Style.Name, this);
+
+		base.UnassignDocument();
+
+		this._style = (DimensionStyle)this.Style?.Clone();
+	}
+}

@@ -1,0 +1,6 @@
+<Project>
+  <!-- third_party/ACadSharp는 net10.0까지 멀티타깃이지만 이 저장소는 net8.0만 사용함 (.NET 10 SDK 불필요) -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'ACadSharp'">
+    <TargetFrameworks>net8.0</TargetFrameworks>
+  </PropertyGroup>
+</Project>

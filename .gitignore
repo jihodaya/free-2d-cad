@@ -1,0 +1,17 @@
+# 빌드 결과
+bin/
+obj/
+dist/
+TestResults/
+*.user
+.vs/
+.idea/
+
+# 도면 작업 파일 (실무 도면은 올리지 않음)
+sample/
+*.bak
+*.dwl
+*.dwl2
+
+# 개인 설정
+.claude/

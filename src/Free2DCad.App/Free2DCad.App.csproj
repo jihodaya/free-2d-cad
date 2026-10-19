@@ -1,0 +1,35 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>Free2DCad</AssemblyName>
+    <!-- 배포 버전 (시작 페이지·제목 줄·도움말에 표시) -->
+    <Version>0.3</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 실행 파일(exe) 아이콘. 다시 만들려면 python build\make_icon.py -->
+    <ApplicationIcon>Assets\Free2DCad.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 창·작업 표시줄 아이콘 -->
+    <EmbeddedResource Include="Assets\Free2DCad.ico" LogicalName="Free2DCad.App.Free2DCad.ico" />
+    <EmbeddedResource Include="Assets\Free2DCad.png" LogicalName="Free2DCad.App.Free2DCad.png" />
+    <!-- 맞춤법 검사 영어 사전 (Hunspell en_US/SCOWL, 허가 문구 Assets\Spelling\README_en_US.txt) -->
+    <EmbeddedResource Include="Assets\Spelling\en_US.words.gz" LogicalName="Free2DCad.App.en_US.words.gz" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.3" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.3" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+  </ItemGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\Free2DCad.Rendering\Free2DCad.Rendering.csproj" />
+		<ProjectReference Include="..\Free2DCad.Core\Free2DCad.Core.csproj" />
+	</ItemGroup>
+
+</Project>
